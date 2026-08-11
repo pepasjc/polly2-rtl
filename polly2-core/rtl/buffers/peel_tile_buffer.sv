@@ -80,6 +80,14 @@ module peel_tile_buffer import tsp_pkg::*; #(
     input                       b_ispt,      // fragment came from the PT list (rides
                                              // into the slot ispt bits for the
                                              // taginvw images' alpha-test enable)
+    // ---- MODIFIER VOLUME pass (b_peeling and b_fwd must both be 0) ----
+    // refsw2 PixelFlush_isp forces mode = 6 (greater-or-equal) for RM_MODIFIER and
+    // ignores the record's DepthMode field - the ISP word of a modvol record holds
+    // VolumeMode in those bits, not a depth mode. A modvol fragment writes NOTHING
+    // here (no depth, no tag, no valid): its only effect is the stencil flip, which
+    // stencil_tile_buffer performs from b_mv_we.
+    input                       b_modvol,
+    output     [LANES-1:0]      b_mv_we,     // per-lane modvol depth-test pass
     output     [LANES-1:0]      b_pass_lp,   // per-lane slot-A accept (for dt_pt +
                                              // the u_taginvw A-image duplicate)
     output     [LANES-1:0]      b_pass_b,    // per-lane slot-B accept (peel only)
@@ -352,7 +360,7 @@ module peel_tile_buffer import tsp_pkg::*; #(
             // ignores the ISP field, so honoring a game's junk DepthMode here
             // would mis-compare against the opaque ceiling.
             isp_depth_cmp u_cmp (
-                .mode(b_fwd ? 3'd6 : b_mode),
+                .mode((b_fwd | b_modvol) ? 3'd6 : b_mode),
                 .nw  (b_invw[31*gd +: 31]),
                 .ob  (b_fwd ? f_zceil(rdata, gd) : f_depth(rdata, gd)),
                 .pass(ras_pass_op[gd]));
@@ -506,11 +514,14 @@ module peel_tile_buffer import tsp_pkg::*; #(
     // identical mask - it must see exactly the shaded fragments, so this stays
     // ACCEPT-ONLY even though the internal write set below is wider on peel lanes
     // (a DEFERRED lane also writes, to move zb3; its other fields are kept).
-    assign b_we = ras_b_valid ? (b_inside &
+    // A MODVOL fragment writes nothing (here or in u_taginvw) - it only flips the
+    // stencil - so b_we is forced low and the accept goes out on b_mv_we instead.
+    assign b_we = (ras_b_valid && !b_modvol) ? (b_inside &
                   (b_peeling ? ras_pass_lp : b_fwd ? ras_pass_fwd : ras_pass_op)) : '0;
+    assign b_mv_we = (ras_b_valid && b_modvol) ? (b_inside & ras_pass_op) : '0;
     // the internal stage-B write set: accepts, PLUS (peel only) deferred lanes. A
     // deferred lane costs no extra RAM traffic - the port is idle on the cycles it
-    // would use anyway.
+    // would use anyway. (A modvol stage B never writes: w_ras below excludes it.)
     wire [NB-1:0] ras_we = b_inside &
                   (b_peeling ? (ras_pass_lp | ras_pass_b | ras_more_lp)
                              : b_fwd ? ras_pass_fwd : ras_pass_op);
@@ -543,7 +554,9 @@ module peel_tile_buffer import tsp_pkg::*; #(
     wire w_bf  = !w_clr && pb_wr_valid && !pb_ptwalk &&  pb_bfin;
     wire w_zk  = !w_clr && pb_wr_valid && !pb_ptwalk && !pb_bfin &&  pb_zkeep;
     wire w_pb  = !w_clr && pb_wr_valid && !pb_ptwalk && !pb_bfin && !pb_zkeep;
-    wire w_ras = !w_clr && !pb_wr_valid && ras_b_valid;
+    // a MODVOL stage B writes NOTHING back (no depth, no tag, no valid, no zb3/B
+    // slot) - its only effect is the stencil flip in stencil_tile_buffer
+    wire w_ras = !w_clr && !pb_wr_valid && ras_b_valid && !b_modvol;
 
     integer cw;
     always @(*) begin : wmux
