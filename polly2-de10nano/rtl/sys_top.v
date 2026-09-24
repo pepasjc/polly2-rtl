@@ -770,14 +770,14 @@ assign HDMI_I2S   = aud_sdata;
 sigma_delta_dac dac_left
 (
 	.clk (clk_audio),
-	.din (aud_left ^ 16'h8000),
+	.din (aud_left),
 	.dout(analog_audio_l)
 );
 
 sigma_delta_dac dac_right
 (
 	.clk (clk_audio),
-	.din (aud_right ^ 16'h8000),
+	.din (aud_right),
 	.dout(analog_audio_r)
 );
 
