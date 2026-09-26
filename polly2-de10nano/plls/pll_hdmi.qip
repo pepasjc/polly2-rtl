@@ -476,6 +476,7 @@ set_global_assignment -entity "pll_hdmi_0002" -library "pll_hdmi" -name IP_COMPO
 
 set_global_assignment -library "pll_hdmi" -name VERILOG_FILE [file join $::quartus(qip_path) "pll_hdmi.v"]
 set_global_assignment -library "pll_hdmi" -name VERILOG_FILE [file join $::quartus(qip_path) "pll_hdmi/pll_hdmi_0002.v"]
+set_global_assignment -library "pll_hdmi" -name VERILOG_FILE [file join $::quartus(qip_path) "pll_hdmi/pll_hdmi_27m_0002.v"]
 set_global_assignment -library "pll_hdmi" -name QIP_FILE [file join $::quartus(qip_path) "pll_hdmi/pll_hdmi_0002.qip"]
 
 set_global_assignment -entity "pll_hdmi_0002" -library "pll_hdmi" -name IP_TOOL_NAME "altera_pll"
