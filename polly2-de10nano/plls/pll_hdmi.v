@@ -13,7 +13,12 @@ module pll_hdmi (
 		output wire [63:0] reconfig_from_pll  // reconfig_from_pll.reconfig_from_pll
 	);
 
+`ifdef CRT_LINE_MODE
+	// CRT build: 27.000 MHz for the 15 kHz spg raster (Quartus 18.1 ip-generate)
+	pll_hdmi_27m_0002 pll_hdmi_inst (
+`else
 	pll_hdmi_0002 pll_hdmi_inst (
+`endif
 		.refclk            (refclk),            //            refclk.clk
 		.rst               (rst),               //             reset.reset
 		.outclk_0          (outclk_0),          //           outclk0.clk
