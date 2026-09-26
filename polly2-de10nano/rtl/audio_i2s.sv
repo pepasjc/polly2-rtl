@@ -34,6 +34,7 @@ module audio_i2s
 
 	// read side / I2S out (clk_audio = 24.576 MHz)
 	input  wire        aclk,
+	input  wire  [4:0] att,           // [3:0] >>> per 6 dB, [4] mute (quasi-static, any clock)
 	output wire        sclk,          // 3.072 MHz bit clock (64fs)
 	output wire        lrclk,         // 48 kHz word clock, low = left
 	output reg         sdata = 1'b0,
@@ -89,6 +90,8 @@ reg [11:0] wgray_a1 = 12'd0;   // wgray -> aclk 2FF synchronizer
 reg [11:0] wgray_a2 = 12'd0;
 
 wire        empty     = (rgray == wgray_a2);
+
+reg [4:0] att_a1 = 5'd0, att_a2 = 5'd0;   // att -> aclk (changes rarely)
 wire [11:0] rbin_next = rbin + 12'd1;
 
 // free-running frame divider: [2] = SCLK, [8] = LRCLK, wraps every 512
@@ -113,6 +116,8 @@ wire  [4:0] bidx5 = 5'd16 - slot;                // slots 1..16 -> bits 15..0
 always @(posedge aclk) begin
 	wgray_a1 <= wgray;
 	wgray_a2 <= wgray_a1;
+	att_a1   <= att;
+	att_a2   <= att_a1;
 
 	adiv <= adiv_next;
 
@@ -128,7 +133,10 @@ always @(posedge aclk) begin
 
 	// next frame's sample lands exactly on the LRCLK falling edge; slot 0
 	// carries no data (I2S one-bit delay), so the swap is never audible
-	if (adiv == 9'h1FF) sample <= rdata_q;
+	if (adiv == 9'h1FF)
+		sample <= att_a2[4] ? 32'd0
+		        : {$signed(rdata_q[31:16]) >>> att_a2[3:0],
+		           $signed(rdata_q[15:0])  >>> att_a2[3:0]};
 
 	// data transitions on every SCLK falling edge (adiv[2:0] wraps 7 -> 0)
 	if (adiv[2:0] == 3'b111)
