@@ -46,7 +46,11 @@
 //                            start of vertical blanking.
 //   0xFF202024  FB_BOT       RW. Same, for the bottom border
 //                            (lines 1020..1079).
-//   0xFF202028 - 0xFF20203C  reserved (read 0, writes ignored).
+//   0xFF202028  AUDIO_VOL    RW. [3:0] attenuation, 6 dB per step (sample
+//                            >>> n), [4] mute - the same encoding as
+//                            MiSTer's volume (config/Volume.dat). Applied
+//                            to every audio output. Power-up AUD_ATT_INIT.
+//   0xFF20202C - 0xFF20203C  reserved (read 0, writes ignored).
 //
 // Single clock domain (clk_sys). waitrequest is low except for AUDIO_DATA
 // writes with the FIFO full - every other access completes immediately;
@@ -55,7 +59,8 @@
 module pvr_mmio
 #(
 	parameter [7:0]  VRAM_TOP_INIT = 8'h32,   // 0x32000000
-	parameter        RST_CYCLES    = 256      // max 511
+	parameter        RST_CYCLES    = 256,     // max 511
+	parameter [4:0]  AUD_ATT_INIT  = 5'd0     // AUDIO_VOL power-up value
 )
 (
 	input  wire        clk,           // clk_sys
@@ -87,6 +92,7 @@ module pvr_mmio
 	output reg  [31:0] aud_wdata = 32'd0,
 	input  wire        aud_full,
 	input  wire [11:0] aud_level,
+	output reg   [4:0] aud_att   = AUD_ATT_INIT,   // AUDIO_VOL
 
 	// SPG border band framebuffers (128-byte-aligned byte addr, 0 = off)
 	output reg  [31:0] fb_top    = 32'd0,
@@ -163,6 +169,7 @@ always @(posedge clk) begin
 			end
 			4'd8: fb_top <= {avs_writedata[31:7], 7'd0};   // FB_TOP (128B aligned)
 			4'd9: fb_bot <= {avs_writedata[31:7], 7'd0};   // FB_BOT
+			4'd10: aud_att <= avs_writedata[4:0];          // AUDIO_VOL
 			default: ;                                     // STATUS/CYCLES/rsvd: RO
 		endcase
 	end
@@ -193,6 +200,7 @@ always @(posedge clk) begin
 			4'd7: avs_readdata <= REVISION;                // REVISION
 			4'd8: avs_readdata <= fb_top;                  // FB_TOP
 			4'd9: avs_readdata <= fb_bot;                  // FB_BOT
+			4'd10: avs_readdata <= {27'd0, aud_att};       // AUDIO_VOL
 			default: ;
 		endcase
 	end

@@ -337,10 +337,15 @@ wire  [1:0] mmio_clk_sel;
 wire        aud_fifo_wr, aud_fifo_full;
 wire [31:0] aud_fifo_wdata;
 wire [11:0] aud_fifo_level;
+wire  [4:0] aud_att;
 
 wire [31:0] fb_top_base, fb_bot_base;
 
-pvr_mmio pvr_mmio
+pvr_mmio
+`ifdef CRT_LINE_MODE
+#(.AUD_ATT_INIT(5'd4))                   // CRT carriers drive amps: start at -24 dB
+`endif
+pvr_mmio
 (
 	.clk              (clk_sys),
 
@@ -366,6 +371,7 @@ pvr_mmio pvr_mmio
 	.aud_wdata        (aud_fifo_wdata),
 	.aud_full         (aud_fifo_full),
 	.aud_level        (aud_fifo_level),
+	.aud_att          (aud_att),
 
 	.fb_top           (fb_top_base),
 	.fb_bot           (fb_bot_base)
@@ -733,6 +739,7 @@ audio_i2s audio_i2s
 	.level(aud_fifo_level),
 
 	.aclk (clk_audio),
+	.att  (aud_att),
 	.sclk (aud_sclk),
 	.lrclk(aud_lrclk),
 	.sdata(aud_sdata),
