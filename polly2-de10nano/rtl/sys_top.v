@@ -547,7 +547,22 @@ wire [23:0] hdmi_data;
 wire        hdmi_hs, hdmi_vs, hdmi_de, hdmi_vbl, hdmi_brd;
 wire        spg_underrun;
 
-spg spg
+// CRT build: `define CRT_LINE_MODE 1 (240p) / 2 (480i) selects a 15 kHz
+// 1440-wide raster at the 27 MHz pll_hdmi (MiSTercade / direct-video DACs).
+spg
+`ifdef CRT_LINE_MODE
+#(
+	.H_ACTIVE(1440), .H_FP(38), .H_SYNC(124), .H_BP(114),   // H total 1716 -> 15.73 kHz
+	.V_ACTIVE(240),  .V_FP(4),  .V_SYNC(3),   .V_BP(15),    // 262 (+1 in 480i field 1)
+	.LINE_MODE(`CRT_LINE_MODE),
+`ifdef CRT_FIELD_SWAP
+	.FIELD_SWAP(1)
+`else
+	.FIELD_SWAP(0)
+`endif
+)
+`endif
+spg
 (
 	.clk         (clk_hdmi),
 	.reset       (reset_req),
