@@ -136,6 +136,7 @@ assign SDRAM_nCS  = 1'b1;
 assign SDRAM_CLK  = 1'b0;
 assign SDRAM_CKE  = 1'b0;
 
+`ifndef CRT_LINE_MODE
 assign VGA_R  = 6'bZZZZZZ;
 assign VGA_G  = 6'bZZZZZZ;
 assign VGA_B  = 6'bZZZZZZ;
@@ -145,18 +146,21 @@ assign VGA_HS = 1'bZ;       // must stay Z: readable as SD detect on IO boards
 assign AUDIO_L     = 1'bZ;
 assign AUDIO_R     = 1'bZ;
 assign AUDIO_SPDIF = 1'bZ;
-assign SDCD_SPDIF  = 1'bZ;
 
 assign SDIO_DAT = 4'bZZZZ;
 assign SDIO_CMD = 1'bZ;
 assign SDIO_CLK = 1'bZ;
+`endif
+assign SDCD_SPDIF  = 1'bZ;
 
 assign SD_SPI_CS   = 1'bZ;
 assign SD_SPI_CLK  = 1'bZ;
 assign SD_SPI_MOSI = 1'bZ;
 
+`ifndef CRT_LINE_MODE
 assign IO_SCL  = 1'bZ;
 assign IO_SDA  = 1'bZ;
+`endif
 assign USER_IO = 7'bZZZZZZZ;
 
 assign ADC_SCK    = 1'b0;
@@ -607,10 +611,10 @@ spg
 reg        hdmi_out_hs, hdmi_out_vs, hdmi_out_de;
 reg [23:0] hdmi_out_d;
 
-`ifdef CRT_CSYNC
-// CRT build: composite sync on the HDMI HSYNC line, exactly like Main_MiSTer's
-// direct_video with composite_sync=1 (sys_top dv_hs1 <= csync_en ? dv_cs : dv_hs).
-// JAMMA/direct-video DACs (MiSTercade) route that line to the monitor's sync.
+`ifdef CRT_LINE_MODE
+// CRT build: composite sync (Template_MiSTer csync module). Drives the analog
+// VGA_HS pin, and with CRT_CSYNC also the HDMI HSYNC line, exactly like
+// Main_MiSTer's direct_video with composite_sync=1 (dv_hs1 <= csync_en ? dv_cs : dv_hs).
 wire hdmi_cs;
 csync csync_hdmi(clk_hdmi, hdmi_hs, hdmi_vs, hdmi_cs);
 `endif
@@ -718,6 +722,7 @@ pll_audio pll_audio
 );
 
 wire aud_sclk, aud_lrclk, aud_sdata;
+wire [31:0] aud_sample;
 
 audio_i2s audio_i2s
 (
@@ -730,13 +735,86 @@ audio_i2s audio_i2s
 	.aclk (clk_audio),
 	.sclk (aud_sclk),
 	.lrclk(aud_lrclk),
-	.sdata(aud_sdata)
+	.sdata(aud_sdata),
+	.cur_sample(aud_sample)
 );
 
 assign HDMI_MCLK  = clk_audio;
 assign HDMI_SCLK  = aud_sclk;
 assign HDMI_LRCLK = aud_lrclk;
 assign HDMI_I2S   = aud_sdata;
+
+`ifdef CRT_LINE_MODE
+//////////////////////////////////////////////////////////////////////////
+// CRT build: MiSTer analog outputs (IO board, MiSTercade and other analog
+// carriers), replicating Template_MiSTer sys_top's pin logic for
+// vga_mode=rgb + composite_sync=1 so the pins behave exactly as under any
+// MiSTer core on the same hardware:
+//   av_dis = io_dig | VGA_EN (active low), io_dig = MCP23009 present ?
+//            its analog/digital flag : SW[3]  -> everything Z when disabled
+//   video : 15 kHz raster from the spg, RGB 6 bits on VGA_*, 2 extra LSBs
+//           per colour on SDIO_* (MCP boards / no secondary SD), csync
+//           (active low) on VGA_HS, VGA_VS high
+//   audio : SW[0] or MCP present -> I2S (SCLK/LRCLK/DATA) to the board's
+//           DAC, else sigma-delta analog on AUDIO_L/R. No S/PDIF.
+//////////////////////////////////////////////////////////////////////////
+wire [2:0] mcp_btn;
+wire       mcp_sdcd, mcp_en, mcp_mode;
+mcp23009 mcp23009
+(
+	.clk(FPGA_CLK2_50),
+
+	.btn(mcp_btn),
+	.led(3'b000),
+	.flg_sd_cd(mcp_sdcd),
+	.flg_present(mcp_en),
+	.flg_mode(mcp_mode),
+
+	.scl(IO_SCL),
+	.sda(IO_SDA)
+);
+
+wire io_dig = mcp_en ? mcp_mode : SW[3];
+wire av_dis = io_dig | VGA_EN;
+wire sd_cd  = SDCD_SPDIF & ~SW[2];
+
+reg [23:0] vga_d;
+reg        vga_cs_n;
+always @(posedge clk_hdmi) begin
+	vga_d    <= hdmi_data;
+	vga_cs_n <= ~hdmi_cs;
+end
+
+assign VGA_R  = av_dis ? 6'bZZZZZZ : vga_d[23:18];
+assign VGA_G  = av_dis ? 6'bZZZZZZ : vga_d[15:10];
+assign VGA_B  = av_dis ? 6'bZZZZZZ : vga_d[7:2];
+assign VGA_HS = av_dis ? 1'bZ      : vga_cs_n;
+assign VGA_VS = av_dis ? 1'bZ      : 1'b1;
+assign {SDIO_CLK,SDIO_CMD,SDIO_DAT} = (av_dis | ~(mcp_en | sd_cd)) ? 6'bZZZZZZ
+                                    : {vga_d[9:8], vga_d[17:16], vga_d[1:0]};
+
+wire analog_l, analog_r;
+sigma_delta_dac #(15) sd_l
+(
+	.CLK(clk_audio),
+	.RESET(1'b0),
+	.DACin({~aud_sample[15], aud_sample[14:0]}),
+	.DACout(analog_l)
+);
+
+sigma_delta_dac #(15) sd_r
+(
+	.CLK(clk_audio),
+	.RESET(1'b0),
+	.DACin({~aud_sample[31], aud_sample[30:16]}),
+	.DACout(analog_r)
+);
+
+wire aud_i2s_out = SW[0] | mcp_en;
+assign AUDIO_SPDIF = av_dis ? 1'bZ : aud_i2s_out ? aud_lrclk : 1'bZ;
+assign AUDIO_R     = av_dis ? 1'bZ : aud_i2s_out ? aud_sdata : analog_r;
+assign AUDIO_L     = av_dis ? 1'bZ : aud_i2s_out ? aud_sclk  : analog_l;
+`endif
 
 //////////////////////////////////////////////////////////////////////////
 // Heartbeats
@@ -757,7 +835,7 @@ wire hb_hdmi = hb_vs_cnt[5];             // ~0.94 Hz when the raster runs
 endmodule
 
 
-`ifdef CRT_CSYNC
+`ifdef CRT_LINE_MODE
 // CSync generation - from MiSTer-devel Template_MiSTer sys/sys_top.v (GPL-3.0)
 // Shifts HSync left by 1 HSync period during VSync
 module csync
