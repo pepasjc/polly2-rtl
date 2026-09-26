@@ -672,6 +672,39 @@ wire hdmi_cs;
 csync csync_hdmi(clk_hdmi, hdmi_hs, hdmi_vs, hdmi_cs);
 `endif
 
+`ifdef CRT_LINE_MODE
+// CRT build: Main_MiSTer direct_video DE (Template sys_top dv_de1): DE high
+// for the whole line except hsync (+4 px after it) on all lines but the few
+// around vsync. Direct-video HDMI DACs get the same stream as from a MiSTer
+// core; the spg drives black outside its active window anyway.
+reg hdmi_dv_de;
+always @(posedge clk_hdmi) begin
+	reg [12:0] vsz, vcnt, vcnt_l, vcnt_ll;
+	reg        old_hs, old_vs;
+	reg        vde;
+	reg  [7:0] hss;                      // 4 px = 8 clocks (1440 samples / 720 px)
+
+	hss <= (hss << 1) | hdmi_hs;
+
+	old_hs <= hdmi_hs;
+	if(~old_hs && hdmi_hs) begin
+		old_vs <= hdmi_vs;
+		if(~&vcnt) vcnt <= vcnt + 1'd1;
+		if(~old_vs & hdmi_vs) begin
+			if (vcnt != vcnt_ll || vcnt < vcnt_l) vsz <= vcnt;
+			vcnt_l <= vcnt;
+			vcnt_ll <= vcnt_l;
+		end
+		if(old_vs & ~hdmi_vs) vcnt <= 0;
+
+		if(vcnt == 1) vde <= 1;
+		if(vcnt == vsz - 3) vde <= 0;
+	end
+
+	hdmi_dv_de <= !{hss,hdmi_hs} && vde;
+end
+`endif
+
 always @(posedge clk_hdmi) begin
 	reg hs, vs, de;
 	reg [23:0] d;
@@ -682,7 +715,11 @@ always @(posedge clk_hdmi) begin
 	hs <= hdmi_hs;
 `endif
 	vs <= hdmi_vs;
+`ifdef CRT_LINE_MODE
+	de <= hdmi_dv_de;
+`else
 	de <= hdmi_de;
+`endif
 	d  <= hdmi_data;
 
 	hdmi_out_hs <= hs;
