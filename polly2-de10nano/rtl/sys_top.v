@@ -664,11 +664,23 @@ spg
 reg        hdmi_out_hs, hdmi_out_vs, hdmi_out_de;
 reg [23:0] hdmi_out_d;
 
+`ifdef CRT_CSYNC
+// CRT build: composite sync on the HDMI HSYNC line, exactly like Main_MiSTer's
+// direct_video with composite_sync=1 (sys_top dv_hs1 <= csync_en ? dv_cs : dv_hs).
+// JAMMA/direct-video DACs (MiSTercade) route that line to the monitor's sync.
+wire hdmi_cs;
+csync csync_hdmi(clk_hdmi, hdmi_hs, hdmi_vs, hdmi_cs);
+`endif
+
 always @(posedge clk_hdmi) begin
 	reg hs, vs, de;
 	reg [23:0] d;
 
+`ifdef CRT_CSYNC
+	hs <= hdmi_cs;
+`else
 	hs <= hdmi_hs;
+`endif
 	vs <= hdmi_vs;
 	de <= hdmi_de;
 	d  <= hdmi_data;
@@ -763,3 +775,45 @@ end
 wire hb_hdmi = hb_vs_cnt[5];             // ~0.94 Hz when the raster runs
 
 endmodule
+
+
+`ifdef CRT_CSYNC
+// CSync generation - from MiSTer-devel Template_MiSTer sys/sys_top.v (GPL-3.0)
+// Shifts HSync left by 1 HSync period during VSync
+module csync
+(
+	input  clk,
+	input  hsync,
+	input  vsync,
+
+	output csync
+);
+
+assign csync = (csync_vs ^ csync_hs);
+
+reg csync_hs, csync_vs;
+always @(posedge clk) begin
+	reg prev_hs;
+	reg [15:0] h_cnt, line_len, hs_len;
+
+	// Count line/Hsync length
+	h_cnt <= h_cnt + 1'd1;
+
+	prev_hs <= hsync;
+	if (prev_hs ^ hsync) begin
+		h_cnt <= 0;
+		if (hsync) begin
+			line_len <= h_cnt - hs_len;
+			csync_hs <= 0;
+		end
+		else hs_len <= h_cnt;
+	end
+
+	if (~vsync) csync_hs <= hsync;
+	else if(h_cnt == line_len) csync_hs <= 1;
+
+	csync_vs <= vsync;
+end
+
+endmodule
+`endif
