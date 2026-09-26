@@ -84,7 +84,15 @@ module spg
 	parameter V_BP     = 36,    // V total 1125
 	// source framebuffer (doubled to SRC_W*2 x SRC_H*2 on screen)
 	parameter SRC_W    = 640,
-	parameter SRC_H    = 480
+	parameter SRC_H    = 480,
+	// LINE_MODE 0: stock - line-doubled 1080p (SRC_H*2 window, border bands).
+	// LINE_MODE 1: 15 kHz 240p - one source line per output line; a 480-line
+	//              source shows its even lines, a 240-line source every line.
+	// LINE_MODE 2: 15 kHz 480i - like 1, but field 1 shows the odd lines and
+	//              runs 263 lines with its vsync half a line later (CEA 480i).
+	// In both 15 kHz modes the window fills all V_ACTIVE lines (no bands).
+	parameter LINE_MODE = 0,
+	parameter FIELD_SWAP = 0         // 480i: 1 = field 0 shows the odd lines
 )
 (
 	input  wire        clk,          // 1080p pixel clock (148.352 / 148.5 MHz)
@@ -154,8 +162,13 @@ localparam [11:0] H_ACT    = H_ACTIVE;
 localparam [10:0] V_ACT    = V_ACTIVE;
 localparam [11:0] X0       = (H_ACTIVE - SRC_W*2)/2;        // 320
 localparam [11:0] X1       = (H_ACTIVE - SRC_W*2)/2 + SRC_W*2; // 1600
-localparam [10:0] Y0       = (V_ACTIVE - SRC_H*2)/2;        // 60
-localparam [10:0] Y1       = (V_ACTIVE - SRC_H*2)/2 + SRC_H*2; // 1020
+localparam        M15K     = (LINE_MODE != 0);
+localparam        ILACE    = (LINE_MODE == 2);
+localparam [10:0] Y0       = M15K ? 11'd0 : (V_ACTIVE - SRC_H*2)/2;        // 60
+localparam [10:0] Y1       = M15K ? V_ACTIVE : (V_ACTIVE - SRC_H*2)/2 + SRC_H*2; // 1020
+localparam [10:0] V_TOTAL1 = V_TOTAL + (ILACE ? 11'd1 : 11'd0);  // 480i field 1: 263
+localparam [11:0] HALF_LN  = H_TOTAL / 2;
+localparam [10:0] LOOK     = M15K ? 11'd1 : 11'd2;   // fetch-ahead, output lines
 
 localparam        BURST_LEN = 16;        // 128-bit beats per burst (256 bytes)
 localparam [7:0]  BC_FULL   = BURST_LEN; // full burstcount
@@ -179,20 +192,29 @@ localparam [1:0] RGN_BOT  = 2'd2;
 
 reg [11:0] hcnt = 12'd0;
 reg [10:0] vcnt = 11'd0;
+reg        field = 1'b0;          // 480i field (always 0 otherwise)
+wire [10:0] vtot_cur = field ? V_TOTAL1 : V_TOTAL;
 
 always @(posedge clk or posedge reset) begin
 	if (reset) begin
-		hcnt <= 12'd0;
-		vcnt <= 11'd0;
+		hcnt  <= 12'd0;
+		vcnt  <= 11'd0;
+		field <= 1'b0;
 	end
 	else begin
 		if (hcnt == H_TOTAL - 12'd1) begin
 			hcnt <= 12'd0;
-			vcnt <= (vcnt == V_TOTAL - 11'd1) ? 11'd0 : vcnt + 11'd1;
+			if (vcnt == vtot_cur - 11'd1) begin
+				vcnt  <= 11'd0;
+				if (ILACE) field <= ~field;
+			end
+			else vcnt <= vcnt + 11'd1;
 		end
 		else hcnt <= hcnt + 12'd1;
 	end
 end
+// field whose lines a source-line mapping uses (FIELD_SWAP flips parity)
+wire field_src = ILACE ? (field ^ (FIELD_SWAP != 0)) : 1'b0;
 
 wire img_v = (vcnt >= Y0) && (vcnt < Y1);
 
@@ -246,6 +268,8 @@ reg  [1:0] req_region = RGN_GAME;
 reg [27:0] req_base   = 28'd0;  // render base: this line's fb_base, in beats
 reg  [8:0] req_beats  = 9'd0;   // beats to fetch (game lines; bands use BAND_BEATS)
 reg        req_half   = 1'b0;   // this line's fb_disp_half
+reg        req_step2  = 1'b0;   // advance 2 strides (15 kHz line skip)
+reg        req_init1  = 1'b0;   // first line starts at +1 stride (480i odd field)
 reg [11:0] last_req   = 12'hFFF;   // {region, src}
 reg  [1:0] cnt_req    = 2'd0;
 
@@ -255,9 +279,10 @@ initial begin line_roff[0] = 4'd0; line_roff[1] = 4'd0; end
 
 // wraps only for the top band, whose first request lands 2 lines before
 // the raster does (V_TOTAL-2 -> line 0)
-wire [10:0] y_look_raw = vcnt + 11'd2;
-wire [10:0] y_look     = (y_look_raw >= V_TOTAL) ? y_look_raw - V_TOTAL
-                                                 : y_look_raw;
+wire [10:0] y_look_raw = vcnt + LOOK;
+wire        look_wrap  = (y_look_raw >= vtot_cur);
+wire [10:0] y_look     = look_wrap ? y_look_raw - vtot_cur : y_look_raw;
+wire        look_fld   = ILACE ? (field_src ^ look_wrap) : 1'b0;
 
 wire        look_top  = (y_look < Y0) && top_en_lat;
 wire        look_game = (y_look >= Y0) && (y_look < Y1);
@@ -271,7 +296,11 @@ wire  [1:0] look_vsh  = look_game ? vshift : 2'd1;   // bands are always 2x
 /* verilator lint_off UNUSEDSIGNAL */
 wire [10:0] look_shf = look_rel >> look_vsh;
 /* verilator lint_on UNUSEDSIGNAL */
-wire  [9:0] look_src = look_shf[9:0];
+// 15 kHz: one source line per output line (every 2nd line of a 480 source,
+// the field parity picking even/odd in 480i; every line of a 240p source)
+wire  [9:0] look_src = !M15K ? look_shf[9:0]
+                     : dbl_lat ? look_rel[9:0]
+                               : {look_rel[8:0], look_fld};
 wire [11:0] look_key = {look_rgn, look_src};
 
 // game-line fetch length: whole beats covering the FB-view bytes of one
@@ -307,12 +336,16 @@ reg        look_buf_r   = 1'b0;
 reg        look_game_r  = 1'b0;
 reg  [3:0] look_roff_r  = 4'd0;
 reg  [8:0] look_beats_r = 9'd0;
+reg        look_step2_r = 1'b0;   // 15 kHz skip: advance 2 source lines per request
+reg        look_init1_r = 1'b0;   // 480i odd field: region starts 1 source line in
 always @(posedge clk) begin
 	look_in_r    <= look_in;
 	look_key_r   <= look_key;
 	look_rgn_r   <= look_rgn;
-	look_sof_r   <= (look_src == 10'd0);
-	look_buf_r   <= look_src[0];
+	look_sof_r   <= M15K ? (look_rel == 11'd0) : (look_src == 10'd0);
+	look_buf_r   <= M15K ? look_rel[0] : look_src[0];
+	look_step2_r <= M15K && !dbl_lat;
+	look_init1_r <= M15K && !dbl_lat && look_fld;
 	look_game_r  <= look_game;
 	look_roff_r  <= look_roff;
 	look_beats_r <= look_beats;
@@ -351,6 +384,8 @@ always @(posedge clk or posedge reset) begin
 			req_base   <= fbs_stable[31:4];
 			req_half   <= fbs_stable[32];
 			req_beats  <= look_beats_r;
+			req_step2  <= look_step2_r;
+			req_init1  <= look_init1_r;
 			line_roff[look_buf_r] <= look_game_r ? look_roff_r : 4'd0;
 			last_req   <= look_key_r;
 			cnt_req    <= cnt_req + 2'd1;
@@ -399,8 +434,10 @@ always @(posedge avl_clk) begin : fetch_fsm
 
 	if ((req_edge || pending) && !fetching) begin
 		pending        <= 1'b0;
-		no = req_sof ? 28'd0
-		             : line_off + {17'd0, req_game ? adv_lat : BAND_ADV};
+		no = req_sof ? (req_init1 ? {17'd0, adv_lat} : 28'd0)
+		             : line_off + (!req_game ? {17'd0, BAND_ADV}
+		                          : req_step2 ? {16'd0, adv_lat, 1'b0}
+		                                      : {17'd0, adv_lat});
 		line_off       <= no;
 		na = (req_game ? req_base : band_base) + no;
 		avl_address    <= na;
@@ -518,7 +555,10 @@ wire  [1:0] d_vsh   = band_v ? 2'd1 : vshift;
 wire [10:0] y_shf   = d_rel >> d_vsh;
 wire [11:0] x_pre   = hcnt + 12'd2 - X0;     // lookahead: pixel needed in 2 clks
 /* verilator lint_on UNUSEDSIGNAL */
-wire  [9:0] src_cur = y_shf[9:0];
+wire  [9:0] src_cur = !M15K ? y_shf[9:0]
+                    : dbl_lat ? y_rel[9:0]
+                              : {y_rel[8:0], field_src};
+wire        dbuf    = M15K ? y_rel[0] : src_cur[0];   // line-buffer parity
 
 // Line-constant display selects, REGISTERED: vcnt only changes when hcnt
 // wraps, so per-clock copies are settled from hcnt==1 on - hundreds of
@@ -534,8 +574,8 @@ reg        pd_sel_r   = 1'b0;
 always @(posedge clk) begin
 	band_v_r   <= band_v;
 	disp_dep_r <= band_v ? 2'd1 : dep_lat;   // bands read as 16bpp
-	roff_r     <= band_v ? 4'd0 : line_roff[src_cur[0]];
-	rbuf_r     <= src_cur[0];
+	roff_r     <= band_v ? 4'd0 : line_roff[dbuf];
+	rbuf_r     <= dbuf;
 	pd_sel_r   <= pd_lat && !band_v;
 end
 assign rbuf = rbuf_r;
@@ -575,9 +615,15 @@ wire hs_c  = (hcnt >= HS_BEG) && (hcnt < HS_END);
 // as ascal's o_vsv): rise at HS_BEG of line VS_BEG, fall at HS_BEG of line
 // VS_END. Toggling at hcnt==0 instead puts the VS edge 2008 px before HS,
 // which some HDMI sinks reject as an unsupported mode.
-wire vs_c  = (vcnt == VS_BEG && hcnt >= HS_BEG) ||
-             (vcnt >  VS_BEG && vcnt <  VS_END) ||
-             (vcnt == VS_END && hcnt <  HS_BEG);
+// 480i field 1: the whole vsync pulse sits half a line later (edges at
+// HS_BEG + H_TOTAL/2, i.e. mid-line of the following line) -> 262.5-line fields
+wire        vs_half = ILACE && field;
+wire [10:0] vs_b    = vs_half ? VS_BEG + 11'd1 : VS_BEG;
+wire [10:0] vs_e    = vs_half ? VS_END + 11'd1 : VS_END;
+wire [11:0] vs_x    = vs_half ? HS_BEG + HALF_LN - H_TOTAL : HS_BEG;
+wire vs_c  = (vcnt == vs_b && hcnt >= vs_x) ||
+             (vcnt >  vs_b && vcnt <  vs_e) ||
+             (vcnt == vs_e && hcnt <  vs_x);
 wire vbl_c = (vcnt >= V_ACT);
 wire img_c = img_h && (img_v || band_v);
 
@@ -675,7 +721,7 @@ always @(posedge clk or posedge reset) begin
 		// Just before the window pixels of the FIRST output line of each
 		// source line: the fetch for this line (issued 2 output lines ago)
 		// must have completed; only the next line's fetch may be in flight.
-		if (img_v && hcnt == X0 - 12'd4 && y_rel[0] == 1'b0
+		if (img_v && hcnt == X0 - 12'd4 && (M15K || y_rel[0] == 1'b0)
 		    && (cnt_req - cnt_done) >= 2'd2) underrun <= 1'b1;
 	end
 end
