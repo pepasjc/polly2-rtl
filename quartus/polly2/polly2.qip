@@ -115,6 +115,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/spg.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/pvr_mmio.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/hps_lw_bridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/audio_i2s.sv
+set_global_assignment -name VERILOG_FILE ../../polly2-de10nano/rtl/i2c.v
+set_global_assignment -name VERILOG_FILE ../../polly2-de10nano/rtl/sigma_delta_dac.v
+set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/mcp23009.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/clk_mux_gf.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-de10nano/rtl/irq_stretch.sv
 

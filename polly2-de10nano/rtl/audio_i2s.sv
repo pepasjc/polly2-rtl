@@ -36,7 +36,8 @@ module audio_i2s
 	input  wire        aclk,
 	output wire        sclk,          // 3.072 MHz bit clock (64fs)
 	output wire        lrclk,         // 48 kHz word clock, low = left
-	output reg         sdata = 1'b0
+	output reg         sdata = 1'b0,
+	output wire [31:0] cur_sample     // frame on the wire (analog DACs)
 );
 
 function [11:0] bin2gray(input [11:0] b);
@@ -100,6 +101,7 @@ wire [8:0] adiv_next = adiv + 9'd1;
 reg [31:0] rdata_q = 32'd0;   // popped RAM word
 reg        got     = 1'b0;    // rdata_q valid for the upcoming frame
 reg [31:0] sample  = 32'd0;   // the frame currently on the wire
+assign cur_sample = sample;
 
 // upcoming SCLK slot (0..31 in each half) and half, after this divider tick
 wire [4:0] slot = adiv_next[7:3];
