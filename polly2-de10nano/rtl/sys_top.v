@@ -341,7 +341,7 @@ wire [11:0] aud_fifo_level;
 wire  [4:0] aud_att;
 
 wire [31:0] fb_top_base, fb_bot_base;
-wire  [3:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
+wire  [4:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
 
 pvr_mmio
 `ifdef CRT_LINE_MODE
@@ -654,7 +654,7 @@ spg
 
 	// quasi-static clk_sys register: spg synchronises it (2-flop) and adopts
 	// it at the start of vertical blanking; ignored when LINE_MODE = 0
-	.crt_ctrl    (crt_ctrl),
+	.crt_ctrl    (crt_ctrl[3:0]),
 
 	.fb_top_base (fb_top_base),
 	.fb_bot_base (fb_bot_base),
@@ -824,8 +824,8 @@ assign HDMI_I2S   = aud_sdata;
 //////////////////////////////////////////////////////////////////////////
 // CRT build: MiSTer analog outputs (IO board, MiSTercade and other analog
 // carriers), replicating Template_MiSTer sys_top's pin logic for
-// vga_mode=rgb + composite_sync=1 so the pins behave exactly as under any
-// MiSTer core on the same hardware:
+// vga_mode=rgb/ypbpr + composite_sync=1 so the pins behave exactly as under
+// any MiSTer core on the same hardware:
 //   av_dis = io_dig | VGA_EN (active low), io_dig = MCP23009 present ?
 //            its analog/digital flag : SW[3]  -> everything Z when disabled
 //   video : 15 kHz raster from the spg, RGB 6 bits on VGA_*, 2 extra LSBs
@@ -854,11 +854,35 @@ wire io_dig = mcp_en ? mcp_mode : SW[3];
 wire av_dis = io_dig | VGA_EN;
 wire sd_cd  = SDCD_SPDIF & ~SW[2];
 
+// Template's vga_out on the analog path, as in any MiSTer core: RGB, or
+// YPbPr (Pr/Y/Pb on R/G/B) when CRT_CTRL[4] asks for vga_mode=ypbpr. Both
+// take the same 3-stage pipeline, and csync rides through it alongside.
+reg  [1:0] ypbpr_s = 2'd0;       // CRT_CTRL[4] (clk_sys, quasi-static)
+always @(posedge clk_hdmi) ypbpr_s <= {ypbpr_s[0], crt_ctrl[4]};
+
+wire [23:0] vga_o;
+wire        vga_cs_o;
+vga_out vga_out
+(
+	.clk     (clk_hdmi),
+	.ypbpr_en(ypbpr_s[1]),
+	.hsync   (1'b0),
+	.vsync   (1'b0),
+	.csync   (hdmi_cs),
+	.de      (1'b0),
+	.din     (hdmi_data),
+	.dout    (vga_o),
+	.hsync_o (),
+	.vsync_o (),
+	.csync_o (vga_cs_o),
+	.de_o    ()
+);
+
 reg [23:0] vga_d;
 reg        vga_cs_n;
 always @(posedge clk_hdmi) begin
-	vga_d    <= hdmi_data;
-	vga_cs_n <= ~hdmi_cs;
+	vga_d    <= vga_o;
+	vga_cs_n <= ~vga_cs_o;
 end
 
 assign VGA_R  = av_dis ? 6'bZZZZZZ : vga_d[23:18];
