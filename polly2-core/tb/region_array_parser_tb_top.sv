@@ -43,12 +43,18 @@ module region_array_parser_tb_top import tsp_pkg::*; (
     (* verilator public_flat_rw *) reg [63:0] vram [0:65535];
     reg busy_r; reg [15:0] word_r; reg [7:0] beats_r, lat_r;
     reg [63:0] dout_r; reg dready_r;
+    // 32-bit VIEW client (dreq.w32): addr[20] is the BANK bit and the half is
+    // returned on dout32 - the job peel_core's arbiter does per burst (of_half).
+    // The parser reads dout32 only, so without this every word it saw was X/0.
+    reg half_r;
     assign dresp.busy=busy_r; assign dresp.dout=dout_r; assign dresp.dready=dready_r;
+    assign dresp.dout32 = half_r ? dout_r[63:32] : dout_r[31:0];
     always @(posedge clk) begin
         dready_r <= 1'b0;
         if (reset) busy_r <= 1'b0;
         else if (!busy_r) begin
             if (dreq.rd) begin busy_r<=1'b1; word_r<=dreq.addr[15:0];
+                half_r<=dreq.w32 && dreq.addr[20];
                 beats_r<=dreq.burst; lat_r<=RD_LAT[7:0]; end
         end else if (lat_r != 0) lat_r <= lat_r - 8'd1;
         else begin
