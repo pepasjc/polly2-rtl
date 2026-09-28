@@ -1031,8 +1031,8 @@ module peel_core import tsp_pkg::*; #(
         .g4_valid(g4_valid_c), .g4_tag(g4_tag_c),
         .g4_invw(g4_invw_c), .g4_pt(g4_pt_c)
     );
-    // ---- MODIFIER-VOLUME stencil (u_stencil, one per u_taginvw copy, below) ----
-    wire [3:0]  g4_inv_h   [0:TI_COPIES-1];
+    // ---- MODIFIER-VOLUME stencil (u_stencil, instanced with the FSM below) ----
+    wire [3:0]  g4_inv_c;        // spanner's 4-wide INV read (image[tsp_tag])
     reg         mv_phase;        // the OM (opaque modifier volume) list is rastering
     reg         mv_sum_and;      // pending summarize is AND (VolumeMode 2), else OR (1)
     // stencil CLEAR/zero walk: the tile CLEAR (refsw ClearBuffers stencilValue=0) plus
@@ -1220,7 +1220,8 @@ module peel_core import tsp_pkg::*; #(
         .tsp_go(spv_tsp_go), .tsp_rd_done(spv_rd_done),
         .rd_valid(spv_rd_valid), .rd_group(spv_rd_group),
         .ti_valid(g4_valid_c), .ti_tag(g4_tag_c), .ti_invw(g4_invw_c), .ti_pt(g4_pt_c),
-        .ti_inv(g4_inv_h[tsp_tag]),
+        // INV only for a pass whose copy carries this pass's summarize (ti_mv)
+        .ti_inv(g4_inv_c & {4{spv_mv}}),
         .ts_we(ts_we), .ts_id(ts_id), .ts_isp(ts_isp), .ts_tsp(ts_tsp), .ts_tcw(ts_tcw),
         .ts_ddx(ts_ddx), .ts_ddy(ts_ddy), .ts_c(ts_c),
         .sp_we(sp_we), .sp_slot(sp_slot),
@@ -1622,8 +1623,8 @@ module peel_core import tsp_pkg::*; #(
     // OPAQUE_MOD list into the stencil -> RenderParamTags<RM_OPAQUE> (the shade that
     // reads the stencil). polly2 normally hands the OP shade off the moment the OP
     // raster drains; with modifier volumes that handoff must WAIT for the OM list,
-    // because handing it flips htile and the stencil the shade needs is built in the
-    // half it is flipping away from. om_pending records "this entry has an OM list"
+    // because handing it advances htile and the INV image the shade needs is built
+    // in the copy it is moving away from. om_pending records "this entry has an OM list"
     // (region_out.has_om, latched at RSTATE_OP) and op_drew snapshots the OP raster's
     // pass_drew across the OM raster, which resets it.
     reg        mv_en;           // +nomodvol: skip the OM phase entirely (A/B bisect aid)
@@ -1651,55 +1652,59 @@ module peel_core import tsp_pkg::*; #(
     //   1 = PEEL: shade only pixels staged this pass (dt_valid)
     integer    sh_pending;   // pixels presented this shade sub-phase (PEEL skips some)
 
-    // ============ MODIFIER-VOLUME stencil instances (one per u_taginvw copy) ============
+    // ============ MODIFIER-VOLUME stencil (u_stencil) ============
     // Placed here, not beside u_taginvw, because its ports reference the FSM state
     // (st/mv_phase) and the bulk-walk cursors declared just above.
-    // r7 port: the stencil copy is zeroed by EVERY walk that (re)initializes its
-    // u_taginvw copy - CLEAR plus the whole tvw_pbc family (PeelBuffers, the z_keep
-    // invalidate, the PT seed/swap/fix walks, and the two-layer CLR2 / BFIN walks) -
-    // so no copy is ever handed to the spanner with a stale INV plane. (The old
-    // two-half design only zeroed on CLEAR and the PeelBuffers/PT walks.)
-    wire        st_pb_zero = tvw_pbc_v;
+    //
+    // ONE working stencil plane + TI_COPIES one-bit INV images (see the
+    // stencil_tile_buffer header). The working plane is ISP-private and is never
+    // copied: like refsw2's stencil byte it lives across region entries, the tile
+    // CLEAR and the PT/TL peel walks zero it (refsw ClearBuffers / PeelBuffers /
+    // PeelBuffersPTInitial), the OM raster flips it and the summarize walk folds it.
+    // Only the INV bit crosses to TSP, through image[htile]: every summarize walk
+    // writes the whole tile's new INV there, so after the OM phase image[htile] holds
+    // exactly the INV the deferred OP shade needs, and it rides u_taginvw's per-copy
+    // credit (the spanner reads image[tsp_tag]). A z_keep=1 entry therefore sees the
+    // INV its predecessor left, as in refsw2 - the working plane is not re-zeroed by
+    // the z_keep invalidate walk.
+    //
+    // ti_mv[copy] marks the ONE kind of hand whose image is meaningful: the deferred
+    // OP shade of an entry whose OM phase ran at least one summarize (mv_inv_ok).
+    // Every other copy the spanner reads (peel / PT passes, background / post-only,
+    // an OP with no modvols) has ti_mv=0 and gets INV=0 - so no copy's image ever
+    // needs clearing for a hand it was not written for. The flag is consumed (and
+    // latched into spv_mv for the pass) when the spanner picks the copy up.
+    // Known deviation from refsw2 (same class as the old two-half design's z_keep
+    // caveat, but narrower): a z_keep=1 entry WITHOUT an OM list of its own shades
+    // its OP with INV=0 even if its predecessor left INV set. No dump in
+    // polly2-data has a multi-entry tile with modifier volumes.
+    reg  [TI_COPIES-1:0] ti_mv;          // per-copy: its INV image is this pass's
+    reg                  spv_mv;         // ...latched for the pass the spanner runs
+    reg                  mv_inv_ok;      // a summarize has run in this OM phase
+    wire        st_pb_zero = pb_bufwr_valid && ((st == S_PEEL_BUF_RUN) || (st == S_PT_INIT)
+                                             || (st == S_PT_SWAP)     || (st == S_PT_FIX));
     assign st_clr_valid = pb_clr_valid || st_pb_zero;
-    assign st_clr_addr  = pb_clr_valid ? pb_clr_addr : tvw_pbc_a;
-    genvar gst;
-    generate
-      for (gst = 0; gst < TI_COPIES; gst = gst + 1) begin : gstencil
-        wire ti_prod = (htile   == TI_AW'(gst));
-        wire ti_cons = (tsp_tag == TI_AW'(gst));
-        // ---- MODIFIER-VOLUME stencil, one per copy on the SAME htile/tsp_tag index ----
-        // Produced entirely within one raster copy: the tile CLEAR zeroes it, the OM
-        // list's raster flips it, the summarize walk folds it into the INV bit, and
-        // the OP shade that immediately follows reads it out of the consumer copy.
-        // Sharing htile is what keeps it coherent with the tags it qualifies - the
-        // credit that says "ISP may write this copy again" is the same credit.
-        //
-        // z_keep=1 CAVEAT: refsw2 carries the stencil INV bit across a z_keep entry
-        // (only ClearBuffers zeroes it), but a z_keep entry's OP lands on another
-        // copy, whose stencil the z_keep invalidate walk has zeroed. No dump in
-        // polly2-data has more than one region entry per tile except `logo`, which
-        // has no modifier volumes, so this has never been observable.
-        stencil_tile_buffer #(.LANES(RAS_LANES)) u_stencil (
-            .clk(clk), .reset(reset),
-            // raster stage A / stage B (producer copy only)
-            // (only the modvol phase reads/writes it - gating stage A on mv_phase
-            //  keeps the buffer completely inert for OP/PT/TL rasters)
-            .ras_a_valid(ti_prod && pb_ra_valid && mv_phase),
-            .ras_a_y(ras_oy), .ras_a_x(ras_ox),
-            .ras_b_valid(ti_prod && b_valid && b_modvol), .mv_we(b_mv_we),
-            .b_y(b_oy), .b_x(b_ox),
-            // CLEAR + the taginvw re-init walks (producer copy only)
-            .clr_valid(ti_prod && st_clr_valid), .clr_addr(st_clr_addr),
-            // summarize RMW walk (producer copy only)
-            .sum_rd_valid(ti_prod && (st == S_MV_SUM)),      .sum_rd_addr(pb_rd),
-            .sum_wr_valid(ti_prod && (st == S_MV_SUM) && pb_pipe), .sum_wr_addr(pb_i),
-            .sum_and(mv_sum_and),
-            // 4-wide aligned read (spanner_v2), consumer copy only
-            .rd4_valid(ti_cons && spv_rd_valid), .rd4_group(spv_rd_group),
-            .g4_inv(g4_inv_h[gst])
-        );
-      end
-    endgenerate
+    assign st_clr_addr  = pb_clr_valid ? pb_clr_addr : pb_bufwr_addr;
+    stencil_tile_buffer #(.LANES(RAS_LANES), .COPIES(TI_COPIES)) u_stencil (
+        .clk(clk), .reset(reset),
+        // INV image copies: produced into htile, read by the spanner from tsp_tag
+        .wr_buf(htile), .rd_buf(tsp_tag),
+        // raster stage A / stage B (only the modvol phase reads/writes it - gating
+        // stage A on mv_phase keeps the buffer completely inert for OP/PT/TL rasters)
+        .ras_a_valid(pb_ra_valid && mv_phase),
+        .ras_a_y(ras_oy), .ras_a_x(ras_ox),
+        .ras_b_valid(b_valid && b_modvol), .mv_we(b_mv_we),
+        .b_y(b_oy), .b_x(b_ox),
+        // CLEAR + the PT/TL peel zero walks
+        .clr_valid(st_clr_valid), .clr_addr(st_clr_addr),
+        // summarize RMW walk
+        .sum_rd_valid(st == S_MV_SUM),               .sum_rd_addr(pb_rd),
+        .sum_wr_valid((st == S_MV_SUM) && pb_pipe), .sum_wr_addr(pb_i),
+        .sum_and(mv_sum_and),
+        // 4-wide aligned read of image[tsp_tag] (spanner_v2)
+        .rd4_valid(spv_rd_valid), .rd4_group(spv_rd_group),
+        .g4_inv(g4_inv_c)
+    );
 
 
     // ---- CONCURRENT TSP shade FSM (tst) + ISP<->TSP handshake (Milestone 2) ----
@@ -2372,6 +2377,7 @@ module peel_core import tsp_pkg::*; #(
             pt_hand_p<=1'b0; pt_free_p<=1'b0; pt_stop<=1'b0;
             mv_phase<=1'b0; mv_hold<=1'b0; mv_sum_and<=1'b0; mv_ret_drain<=1'b0;
             om_pending<=1'b0; op_drew<=1'b0; b_modvol<=1'b0;
+            ti_mv<='0; spv_mv<=1'b0; mv_inv_ok<=1'b0;
             cb_ptres<=1'b0; cb2_ptres<=1'b0;
             for (ti_i=0; ti_i<TI_COPIES; ti_i=ti_i+1) ti_ptres[ti_i]<=1'b0;
             b_fwd<=1'b0;
@@ -2854,10 +2860,11 @@ module peel_core import tsp_pkg::*; #(
                 // OPAQUE MODIFIER VOLUMES (refsw2 RenderObjectList(RM_MODIFIER, ...)
                 // between the opaque raster and RenderParamTags<RM_OPAQUE>). The OP
                 // shade was NOT handed at RSTATE_OP (om_pending), so u_taginvw[htile]
-                // and u_stencil[htile] are still ours: raster the OM list into the
+                // and the INV image[htile] are still ours: raster the OM list into the
                 // stencil (mv_phase => forced-GE compare, no depth/tag write, flip
-                // only), summarize at each volume end, then hand the deferred shade
-                // from the mv branch of S_DRAIN.
+                // only), summarize at each volume end (which lands INV in
+                // image[htile]), then hand the deferred shade from the mv branch of
+                // S_DRAIN.
                 RSTATE_OM: begin
                     if (!om_pending) begin
                         // intensity_shadow=0: two-volume mode, not implemented. Skip.
@@ -2866,6 +2873,7 @@ module peel_core import tsp_pkg::*; #(
                         peeling   <= 1'b0;
                         mv_phase  <= 1'b1;
                         mv_hold   <= 1'b0;
+                        mv_inv_ok <= 1'b0;     // image[htile] not yet this phase's
                         pass_drew <= 1'b0;
                         ol_list_ptr <= ra_out.list_ptr;
                         ol_start <= 1'b1; ol_walk_done <= 1'b0;
@@ -3094,7 +3102,9 @@ module peel_core import tsp_pkg::*; #(
             // SummarizeStencilOr / SummarizeStencilAnd over the whole tile: the same
             // read-ahead / delayed-write chunk walk as PeelBuffers, but on u_stencil
             // only (u_peel's ports are idle here). mv_hold gates the raster consumer
-            // for its duration, so no flip can race the fold.
+            // for its duration, so no flip can race the fold. Every chunk's new INV
+            // also lands in image[htile], so after ANY summarize that image is the
+            // whole tile's current INV (mv_inv_ok).
             S_MV_SUM: begin
                 pb_pipe <= 1'b1;
                 pb_i    <= pb_rd;
@@ -3102,7 +3112,8 @@ module peel_core import tsp_pkg::*; #(
 `ifndef SYNTHESIS
                     pc_mv_sum <= pc_mv_sum + 1;
 `endif
-                    mv_hold <= 1'b0;
+                    mv_hold   <= 1'b0;
+                    mv_inv_ok <= 1'b1;
                     st <= mv_ret_drain ? S_DRAIN : S_OL_RUN;
                 end else if (pb_rd != CHUNK_AW'(NCHUNK-1)) pb_rd <= pb_rd + 1'b1;
             end
@@ -3252,14 +3263,18 @@ module peel_core import tsp_pkg::*; #(
                 end else if (mv_phase || om_pending) begin
                     // ---- OP shade handoff, DEFERRED across this entry's OM list ----
                     // !mv_phase : the OP raster just drained but RSTATE_OM has not run
-                    //   yet. Do NOT hand - the handoff flips htile, and the stencil the
-                    //   shade needs is built in the half we would be flipping away from.
-                    //   Snapshot pass_drew (the OM raster resets it) and just ack, so
-                    //   the region parser presents RSTATE_OM.
+                    //   yet. Do NOT hand - the handoff advances htile, and the INV
+                    //   image the shade needs is built in the copy we would be moving
+                    //   away from. Snapshot pass_drew (the OM raster resets it) and just
+                    //   ack, so the region parser presents RSTATE_OM.
                     //  mv_phase : the modvol raster + its final summarize have drained,
                     //   the stencil is final -> hand the OP shade now. This is the same
                     //   handoff as the plain-OP branch below, on op_drew instead of
-                    //   pass_drew.
+                    //   pass_drew, plus ti_mv: the shade uses image[htile] only if a
+                    //   summarize wrote it this phase (else it would be stale - an OM
+                    //   list that never closes a volume leaves INV unchanged, and
+                    //   treating it as 0 differs from refsw2 only on a z_keep entry
+                    //   whose predecessor left INV set).
                     if (mv_phase) begin
                         mv_phase   <= 1'b0;
                         om_pending <= 1'b0;
@@ -3269,6 +3284,7 @@ module peel_core import tsp_pkg::*; #(
                             ti_last [htile] <= 1'b0;
                             ti_ptres[htile] <= 1'b0;
                             ti_postonly[htile] <= 1'b0;
+                            ti_mv   [htile] <= mv_inv_ok;
                             ti_tx   [htile] <= cur_tx; ti_ty[htile] <= cur_ty;
                             htile <= htile + 1'b1;
 `ifndef SYNTHESIS
@@ -3622,6 +3638,7 @@ module peel_core import tsp_pkg::*; #(
                     md_ty  [md_wp[MD_AW-1:0]] <= ti_ty[tsp_tag];
                     md_wp <= md_wp + 1'b1;
                     ti_ready[tsp_tag]  <= 1'b0;
+                    ti_mv   [tsp_tag]  <= 1'b0;   // (never set for a post-only; hygiene)
                     tsp_tag  <= tsp_tag + 1'b1;
 `ifndef SYNTHESIS
                     pc_span <= pc_span + 1;
@@ -3637,6 +3654,10 @@ module peel_core import tsp_pkg::*; #(
                     // POLARITY: peel_core ti_mode is 0=OP,1=PEEL; spanner_v2 shade_mode is
                     // 1=OP(shade all),0=PEEL(gate on ti_valid) -> INVERT.
                     spv_shade_mode <= ~ti_mode[tsp_tag];
+                    // modvol INV for this pass: only a deferred-OM OP hand carries it.
+                    // Consume the flag here so the copy's next hand starts clean.
+                    spv_mv <= ti_mv[tsp_tag];
+                    ti_mv[tsp_tag] <= 1'b0;
                     spv_start <= 1'b1;
                     spn <= G_START;
 `ifndef SYNTHESIS
@@ -4617,7 +4638,7 @@ module peel_core import tsp_pkg::*; #(
             $fwrite(occ_fd, "F 7 8 %0d\n",  PQ_N);      // PQ    <- pq_n
             $fwrite(occ_fd, "F 13 11 %0d\n", MD_N);     // MDQ   <- mdq_n
             $fwrite(occ_fd, "F 20 27 32\n");            // TEXFQ <- tex_fq_n (tex_fetch4_ob FQ_D)
-            $fwrite(occ_fd, "E 0 0:IDLE,1:RA,2:STATE,4:OL_RUN,9:RA_ACK,10:DONE,11:DRAIN,28:PEEL_INIT,29:PEEL_BUF,32:OP_DONE,34:CLEAR_WR,35:PEEL_BUF_RUN,36:ZK_INV,39:PT_BUF,40:PT_INIT,41:PT_SWAP,42:PT_FIX,43:PT_WAIT,44:PT_NEXT\n");
+            $fwrite(occ_fd, "E 0 0:IDLE,1:RA,2:STATE,4:OL_RUN,9:RA_ACK,10:DONE,11:DRAIN,28:PEEL_INIT,29:PEEL_BUF,32:OP_DONE,34:CLEAR_WR,35:PEEL_BUF_RUN,36:ZK_INV,39:PT_BUF,40:PT_INIT,41:PT_SWAP,42:PT_FIX,43:PT_WAIT,44:PT_NEXT,45:MV_SUM\n");
             $fwrite(occ_fd, "E 5 0:IDLE,1:POP,2:RAS,3:DRAIN,4:CORNER\n");
             $fwrite(occ_fd, "E 13 0:IDLE,1:RUN,3:DRAIN,4:POST\n");
             $fwrite(occ_fd, "E 17 0:TEX,1:VQ,2:SPN_FETCH,3:PARAM,4:OLWALK,5:REGION,6:TEX_PF\n");

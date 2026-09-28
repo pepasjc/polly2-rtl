@@ -11,6 +11,7 @@
 //                                                              filter; owns the caches +
 //                                                              palette; variable latency,
 //                                                              its own in_ready backpressure)
+//   SHAD   : cheap-shadow colour scale        (1 cyc register stage, behind the FIFO)
 //   COMB   : texenv + offset -> ARGB          color_combiner  (3 cyc; now streamed)
 //   FOG    : colour clamp + fog blend         fog_lut (7 cyc, in PARALLEL with the front)
 //                                             + fog_blend (3 cyc, behind COMB)
@@ -68,7 +69,8 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
     // - ALL FOUR base channels, but only R/G/B of the offset colour (the reference
     // leaves Ofs[3], the per-vertex fog weight, alone). The TWO-VOLUME path
     // (intensity_shadow=0, a second TSP/TCW + colour plane set per record) is not
-    // implemented; peel_core forces in_vol low in that mode.
+    // implemented; peel_core forces in_vol low in that mode. in_vol rides the front
+    // with the pixel and the payload FIFO; the scale itself is STAGE SHAD.
     input             in_vol,
     input      [8:0]  shad_mult,          // to_u8_256(FPU_SHAD_SCALE.scale_factor)
 
@@ -333,31 +335,11 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
     // (e.g. the bios BACKGROUND: SRCALPHA/INVSRCALPHA with vertex alpha 0) blends to
     // pure dst and shades whatever the colour buffer last held (black on a cold
     // buffer). Offset colour alpha is NOT affected (refsw2 InterpolateOffs).
-    // CHEAP-SHADOW scale: round((v * mult) / 256). mult==256 (the not-in-volume
-    // case) reduces to v exactly - v*256 is v<<8 and the +128 rounding term cannot
-    // carry into bit 8 - so a scene with no modifier volumes is bit-identical.
-    // refsw2 rounds the UNQUANTIZED float (`0.5f + IpU8(..) * mult / 256`); rounding
-    // the already-converted u8 instead can differ by at most 1 LSB, and only for
-    // pixels that are actually inside a volume.
-    wire [8:0] sh_mult = iv_vol ? shad_mult : 9'd256;
-    function automatic [7:0] sh_scale(input [7:0] v, input [8:0] m);
-        reg [16:0] p;
-        begin
-            p = {9'd0, v} * {8'd0, m} + 17'd128;
-            sh_scale = p[15:8];
-        end
-    endfunction
-    // ALL FOUR base channels scale (the UseAlpha=0 override below is applied AFTER,
-    // matching InterpolateBase); the offset colour scales R/G/B only.
-    wire [7:0] sb_b = sh_scale(u8a[2], sh_mult);
-    wire [7:0] sb_g = sh_scale(u8a[3], sh_mult);
-    wire [7:0] sb_r = sh_scale(u8a[4], sh_mult);
-    wire [7:0] sb_a = sh_scale(u8a[5], sh_mult);
-    wire [7:0] so_b = sh_scale(u8a[6], sh_mult);
-    wire [7:0] so_g = sh_scale(u8a[7], sh_mult);
-    wire [7:0] so_r = sh_scale(u8a[8], sh_mult);
-    wire [31:0] iv_base = {(iv_tsp[20] ? sb_a : 8'd255),sb_r,sb_g,sb_b};
-    wire [31:0] iv_ofs  = {u8a[9],so_r,so_g,so_b};
+    // The CHEAP-SHADOW scale is NOT applied here: it rides the payload FIFO as the
+    // per-pixel iv_vol bit and is applied in its own register stage behind the FIFO
+    // (STAGE SHAD below), so this f2u8 -> FIFO path keeps its old depth.
+    wire [31:0] iv_base = {(iv_tsp[20] ? u8a[5] : 8'd255),u8a[4],u8a[3],u8a[2]};
+    wire [31:0] iv_ofs  = {u8a[9],u8a[8],u8a[7],u8a[6]};
 
     // ==============================================================
     // Decode the per-pixel TCW/TSP fields for tex_unit (same bit layout as tex_fetch_pp).
@@ -480,8 +462,10 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
     // popped on tu_ov. Since tex_unit is in-order lockstep, the k-th pushed payload lines up
     // with the k-th texel result. id is also echoed by tex_unit (tu_oid) for cross-check.
     // ==============================================================
-    localparam integer PLW = 32+32+32+1+1+8+IDW; // base, ofs, tsp, ptx, pof, fogalpha, id
-    wire [PLW-1:0] pl_in = { iv_base, iv_ofs, iv_tsp, iv_ptx, iv_pof, iv_fa, iv_id };
+    // (+1 bit: iv_vol, the cheap-shadow select - free, the MLAB body is 6 cells wide
+    //  either way)
+    localparam integer PLW = 32+32+32+1+1+1+8+IDW; // base, ofs, tsp, ptx, pof, vol, fogalpha, id
+    wire [PLW-1:0] pl_in = { iv_base, iv_ofs, iv_tsp, iv_ptx, iv_pof, iv_vol, iv_fa, iv_id };
     localparam integer PLD = 64, PLAW = 6;
     // ---- M10K FWFT payload FIFO ----
     // The body lives in block RAM; only the HEAD is a register. A head register is
@@ -589,27 +573,82 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
     wire [31:0]    P_tsp  = pl_out[PLW-1-64     -: 32];
     wire           P_ptx  = pl_out[PLW-1-96];
     wire           P_pof  = pl_out[PLW-1-97];
+    wire           P_vol  = pl_out[PLW-1-98];            // cheap-shadow: in a volume
     wire [7:0]     P_fa   = pl_out[IDW          +: 8];   // fog_lut alpha for this pixel
     wire [IDW-1:0] P_id   = pl_out[IDW-1        : 0];
 
     // ==============================================================
-    // STAGE COMB: texenv + offset -> ARGB. color_combiner is streamed (3 cyc). It consumes
-    // the popped payload aligned with tu_ov (tex_unit's ARGB result). A non-textured pixel
-    // forces textel = 0 (base-only). tsp/id ride color_combiner's latency to the output.
+    // STAGE SHAD: the CHEAP-SHADOW colour scale, one register stage between the
+    // payload FIFO head and the combiner. refsw2 InterpolateBase / InterpolateOffs
+    // scale the interpolated colour by mult = to_u8_256(scale_factor):
+    //     round((v * mult) / 256)
+    // on ALL FOUR base channels (the UseAlpha=0 override is applied AFTER, so a
+    // forced 255 alpha stays 255) and on R/G/B of the offset colour (the offset
+    // alpha, the per-vertex fog weight, is left alone). mult==256 (the not-in-volume
+    // case) reduces to v exactly - v*256 is v<<8 and the +128 rounding term cannot
+    // carry into bit 8 - so a scene with no modifier volumes is bit-identical.
+    // refsw2 rounds the UNQUANTIZED float (`0.5f + IpU8(..) * mult / 256`); rounding
+    // the already-converted u8 instead can differ by at most 1 LSB, and only for
+    // pixels that are actually inside a volume.
+    // WHY A STAGE: the seven 8x9 products would otherwise sit behind the
+    // combinational f2u8 on the payload-FIFO write path (or in front of the
+    // combiner's operand select). Here each one is register (pl_hd / sh_mult_r) ->
+    // multiply -> register, and the whole back half is just one cycle longer -
+    // nothing downstream depends on its latency (out_valid/out_id carry the pixel).
     // ==============================================================
-    wire [1:0]  c_shad = P_tsp[7:6];
-    wire [31:0] cc_textel = P_ptx ? tu_argb : 32'h00000000;
+    reg  [8:0]  sh_mult_r;                     // FPU_SHAD_SCALE is static per render
+    always @(posedge clk) sh_mult_r <= shad_mult;
+    function automatic [7:0] sh_scale(input [7:0] v, input [8:0] m);
+        reg [16:0] p;
+        begin
+            p = {9'd0, v} * {8'd0, m} + 17'd128;
+            sh_scale = p[15:8];
+        end
+    endfunction
+    wire [8:0]  sh_m = P_vol ? sh_mult_r : 9'd256;
+    reg         s0_v;
+    // the seven 8x9 products go to DSP blocks (half of them are free in the r7 fit;
+    // ALMs are the scarce resource) - 9x9 mode packs three per block
+    (* multstyle = "dsp" *) reg [31:0] s0_base, s0_ofs;
+    reg  [31:0] s0_tex, s0_tsp;
+    reg         s0_ptx, s0_pof;
+    reg  [7:0]  s0_fa;
+    reg  [IDW-1:0] s0_id;
+    always @(posedge clk) begin
+        if (reset) s0_v <= 1'b0;
+        else       s0_v <= pl_pop;
+        // base: P_base's alpha already holds the UseAlpha=0 override (255) - keep it
+        s0_base <= { (P_tsp[20] ? sh_scale(P_base[31:24], sh_m) : P_base[31:24]),
+                     sh_scale(P_base[23:16], sh_m), sh_scale(P_base[15:8], sh_m),
+                     sh_scale(P_base[7:0],   sh_m) };
+        s0_ofs  <= { P_ofs[31:24],
+                     sh_scale(P_ofs[23:16], sh_m), sh_scale(P_ofs[15:8], sh_m),
+                     sh_scale(P_ofs[7:0],   sh_m) };
+        s0_tex  <= P_ptx ? tu_argb : 32'h00000000;   // a non-textured pixel: textel = 0
+        s0_tsp  <= P_tsp;
+        s0_ptx  <= P_ptx;  s0_pof <= P_pof;
+        s0_fa   <= P_fa;   s0_id  <= P_id;
+    end
+
+    // ==============================================================
+    // STAGE COMB: texenv + offset -> ARGB. color_combiner is streamed (3 cyc). It consumes
+    // the popped payload aligned with tu_ov (tex_unit's ARGB result), one STAGE SHAD later.
+    // A non-textured pixel forces textel = 0 (base-only). tsp/id ride color_combiner's
+    // latency to the output.
+    // ==============================================================
+    wire [1:0]  c_shad = s0_tsp[7:6];
     wire        cc_ov;
     wire [31:0] comb_col;
-    // in_valid = pl_pop (a real FIFO pop), NOT raw tu_ov. color_combiner consumes the POPPED
-    // payload (P_base/P_ofs/P_tsp/...), so its valid must align with an actual pop. This also
-    // suppresses spurious tex_unit out_valid pulses (e.g. the reset/startup glitch): a tu_ov
-    // with an empty FIFO does not pop, so it produces no result - it can't over-count the
-    // core's shade-drain accounting (sh_out_n) or collide the color-buffer read clients.
+    // in_valid = the STAGE SHAD copy of pl_pop (a real FIFO pop), NOT raw tu_ov.
+    // color_combiner consumes the POPPED payload, so its valid must align with an actual
+    // pop. This also suppresses spurious tex_unit out_valid pulses (e.g. the reset/startup
+    // glitch): a tu_ov with an empty FIFO does not pop, so it produces no result - it can't
+    // over-count the core's shade-drain accounting (sh_out_n) or collide the color-buffer
+    // read clients.
     color_combiner u_cc (
-        .clk(clk),.reset(reset),.in_valid(pl_pop),
-        .pp_texture(P_ptx),.pp_offset(P_pof),.shadinstr(c_shad),
-        .base(P_base),.textel(cc_textel),.offset(P_ofs),
+        .clk(clk),.reset(reset),.in_valid(s0_v),
+        .pp_texture(s0_ptx),.pp_offset(s0_pof),.shadinstr(c_shad),
+        .base(s0_base),.textel(s0_tex),.offset(s0_ofs),
         .out_valid(cc_ov),.col(comb_col));
     localparam COMBLAT = 3;
 
@@ -630,8 +669,8 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
     reg [7:0]     o_ofa [0:COMBLAT-1];    // offset alpha (per-vertex fog weight)
     reg           o_pof [0:COMBLAT-1];    // ISP.Offset (gates per-vertex fog)
     always @(posedge clk) begin
-        o_tsp[0]<=P_tsp; o_id[0]<=P_id;
-        o_fa[0]<=P_fa;   o_ofa[0]<=P_ofs[31:24]; o_pof[0]<=P_pof;
+        o_tsp[0]<=s0_tsp; o_id[0]<=s0_id;
+        o_fa[0]<=s0_fa;   o_ofa[0]<=s0_ofs[31:24]; o_pof[0]<=s0_pof;
         for (s=1;s<OUTLAT;s=s+1) begin o_tsp[s]<=o_tsp[s-1]; o_id[s]<=o_id[s-1]; end
         for (s=1;s<COMBLAT;s=s+1) begin
             o_fa[s]<=o_fa[s-1]; o_ofa[s]<=o_ofa[s-1]; o_pof[s]<=o_pof[s-1];
@@ -685,7 +724,7 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
         else if ($test$plusargs("dlwatch"))        begin dl_en = 1'b1; end
     end
     // "stuck" = presenting a stalled pixel with no result anywhere in the drain path.
-    wire dl_draining = tu_ov || cc_ov || out_valid;
+    wire dl_draining = tu_ov || s0_v || cc_ov || out_valid;
     wire dl_stuck_now = in_valid && stall && !dl_draining;
     always @(posedge clk) begin
         if (reset) begin dl_stuck <= 0; dl_fired <= 1'b0; end

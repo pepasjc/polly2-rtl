@@ -72,6 +72,7 @@ module shade_drop_tb_top import tsp_pkg::*; (
         .in_ddx(a_ddx), .in_ddy(a_ddy), .in_c(a_c),
         .tsp(tsp), .tcw(tcw), .text_ctrl(5'd0), .pal_fmt(2'd3),   // 8888 passthrough entries
         .pp_texture(pp_texture), .pp_offset(1'b0),
+        .in_vol(1'b0), .shad_mult(9'd256),                         // no modifier volumes
         .out_valid(out_valid), .out_id(out_id), .out_argb(out_argb), .out_tsp(),
         .stall(stall),
         .pal_addr(pal_addr), .pal_data(pal_data),

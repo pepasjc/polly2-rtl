@@ -10,7 +10,8 @@
 //        clear     : ClearBuffers / PeelBuffers stencilValue = 0
 //     driven through the real peel_core access patterns: the stage A read /
 //     stage B write-back pair, and the read-ahead / delayed-write chunk walk.
-//     Read back through the spanner's 4-wide aligned INV port.
+//     Read back through the spanner's 4-wide aligned INV port (the per-copy INV
+//     image the summarize / clear walks write), including copy isolation.
 //
 //  2. peel_tile_buffer with b_modvol=1 - a modifier-volume fragment must
 //        (a) depth-test with DepthMode FORCED to 6 (greater-or-equal), whatever
@@ -58,17 +59,20 @@ static void stencil_clear(){
     for(int c=0;c<NCHUNK;c++){
         idle(); dut->st_clr_valid=1; dut->st_clr_addr=c; tick();
     }
-    idle();
+    idle(); tick();                 // the registered write port lands the last chunk
     memset(sten,0,sizeof(sten));
 }
 
 // one modvol triangle chunk: stage A presents the read, stage B flips the passing
-// lanes a cycle later (the peel_core raster pair).
+// lanes a cycle later (the peel_core raster pair). The working plane's write port
+// is registered (the flip lands one cycle after stage B), so - like peel_core, where
+// consecutive triangles are >= 3 issue cycles apart - leave one idle cycle before
+// the next chunk may re-read this one.
 static void stencil_flip(int chunk, uint8_t mask){
     int y = chunk>>2, xch = (chunk&3)*LANES;
     idle(); dut->st_ras_a_valid=1; dut->st_ras_a_y=y; dut->st_ras_a_x=xch; tick();
     idle(); dut->st_ras_b_valid=1; dut->st_mv_we=mask; dut->st_b_y=y; dut->st_b_x=xch; tick();
-    idle();
+    idle(); tick();
     for(int l=0;l<LANES;l++) if(mask & (1<<l)){
         int p = chunk*LANES + l;
         sten[p] ^= 0b010;
@@ -85,7 +89,7 @@ static void stencil_summarize(bool is_and){
         dut->st_sum_wr_valid = (c>0);      dut->st_sum_wr_addr = c-1;
         tick();
     }
-    idle();
+    idle(); tick();                 // the registered write port lands the last chunk
     for(int p=0;p<1024;p++){
         if (sten[p] & 0b100) {
             uint8_t inv = sten[p]&1, flip = (sten[p]>>1)&1;
@@ -167,6 +171,23 @@ int main(int argc,char**argv){
         if (rnd()&1) stencil_summarize(rnd()&1);
     }
     stencil_verify("soak");
+
+    // (g) the INV images are per COPY (the u_taginvw copy index): fill copy 1 -
+    //     clear, a volume, a summarize - while copy 0 must keep the soak's INV.
+    {
+        static uint8_t img0[1024];
+        for(int p=0;p<1024;p++) img0[p] = sten[p] & 1;
+        dut->st_wr_buf = 1;
+        stencil_clear();                       // working plane + image[1] -> 0
+        for(int i=0;i<12;i++) stencil_flip(rnd()%NCHUNK, rnd()&0xFF);
+        stencil_summarize(rnd()&1);
+        dut->st_rd_buf = 1;
+        stencil_verify("copy1");
+        dut->st_rd_buf = 0;
+        memcpy(sten, img0, sizeof(sten));      // (model: image[0] = the soak's INV)
+        stencil_verify("copy0_kept");
+        dut->st_wr_buf = 0;
+    }
 
     // ================= 2. peel_tile_buffer, b_modvol =================
     // Seed a known opaque depth/tag, then run a modvol fragment over one chunk.

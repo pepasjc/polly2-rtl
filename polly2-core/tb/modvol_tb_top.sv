@@ -2,7 +2,7 @@
 //
 //   * stencil_tile_buffer : the 3-bit-per-pixel stencil plane - flip/summary
 //     accumulate, SummarizeStencilOr / SummarizeStencilAnd, the CLEAR/zero walk,
-//     and the spanner's 4-wide aligned INV read.
+//     and the spanner's 4-wide aligned INV read of the per-copy INV images.
 //   * peel_tile_buffer with b_modvol=1 : the depth side of a modvol fragment -
 //     DepthMode forced to 6 (greater-or-equal, refsw2 PixelFlush_isp RM_MODIFIER),
 //     the per-lane pass exported on b_mv_we, and NOTHING written back (no depth,
@@ -38,6 +38,9 @@ module modvol_tb_top import tsp_pkg::*; #(
     input                     st_rd4_valid,
     input      [9:0]          st_rd4_group,
     output     [3:0]          st_g4_inv,
+    // ---- stencil: INV image copy selects (2 copies here - see u_stencil) ----
+    input                     st_wr_buf,
+    input                     st_rd_buf,
 
     // ---- peel buffer: CLEAR walk (seed a known depth/tag) ----
     input                     pl_clr_valid,
@@ -75,8 +78,11 @@ module modvol_tb_top import tsp_pkg::*; #(
       end
     endgenerate
 
-    stencil_tile_buffer #(.LANES(LANES)) u_stencil (
+    // COPIES=2: enough to prove the INV images are copy-isolated (peel_core runs
+    // it at TI_COPIES; the copy index is just the top image-address bits).
+    stencil_tile_buffer #(.LANES(LANES), .COPIES(2)) u_stencil (
         .clk(clk), .reset(reset),
+        .wr_buf(st_wr_buf), .rd_buf(st_rd_buf),
         .ras_a_valid(st_ras_a_valid), .ras_a_y(st_ras_a_y), .ras_a_x(st_ras_a_x),
         .ras_b_valid(st_ras_b_valid), .mv_we(st_mv_we), .b_y(st_b_y), .b_x(st_b_x),
         .clr_valid(st_clr_valid), .clr_addr(st_clr_addr),
