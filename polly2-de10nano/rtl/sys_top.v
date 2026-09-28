@@ -341,6 +341,7 @@ wire [11:0] aud_fifo_level;
 wire  [4:0] aud_att;
 
 wire [31:0] fb_top_base, fb_bot_base;
+wire  [2:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
 
 pvr_mmio
 `ifdef CRT_LINE_MODE
@@ -376,7 +377,8 @@ pvr_mmio
 
 	.fb_top           (fb_top_base),
 	.fb_bot           (fb_bot_base),
-	.vram_cfg         (pvr_vram_cfg)
+	.vram_cfg         (pvr_vram_cfg),
+	.crt_ctrl         (crt_ctrl)
 );
 
 //////////////////////////////////////////////////////////////////////////
@@ -622,6 +624,11 @@ spg
 	.H_ACTIVE(1440), .H_FP(38), .H_SYNC(124), .H_BP(114),   // H total 1716 -> 15.73 kHz
 	.V_ACTIVE(240),  .V_FP(4),  .V_SYNC(3),   .V_BP(15),    // 262 (+1 in 480i field 1)
 	.LINE_MODE(`CRT_LINE_MODE),
+	// CRT_CTRL vertical filter hardware: 3 (default) = 2- and 3-tap (+16
+	// M10K), `define CRT_VFILT_TAPS 2 = 2-tap only (+8), 0 = none
+`ifdef CRT_VFILT_TAPS
+	.VFILT_TAPS(`CRT_VFILT_TAPS),
+`endif
 `ifdef CRT_FIELD_SWAP
 	.FIELD_SWAP(1)
 `else
@@ -643,6 +650,10 @@ spg
 	.fb_depth    (fb_disp_depth),
 	.fb_concat   (spvr_fb_r_ctrl[6:4]),
 	.fb_enable   (spvr_fb_r_ctrl[0]),
+
+	// quasi-static clk_sys register: spg synchronises it (2-flop) and adopts
+	// it at the start of vertical blanking; ignored when LINE_MODE = 0
+	.crt_ctrl    (crt_ctrl),
 
 	.fb_top_base (fb_top_base),
 	.fb_bot_base (fb_bot_base),

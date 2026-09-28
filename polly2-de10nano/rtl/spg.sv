@@ -65,6 +65,23 @@
 //    sliding 4-word window), funnels the four bytes down and converts per
 //    fb_depth. Addresses are pre-computed one pixel ahead so the RAM sees
 //    only registered addresses.
+//  - 15 kHz modes (LINE_MODE 1/2): one source line per output line, buffer
+//    parity = output-line parity; the request for row r fires on row r-2
+//    right after its window ends (that row's buffer is the one reused), so a
+//    fetch has ~1.2 output lines (~79 us) before row r. With a 480-line
+//    source, output row r of field f shows source line s = 2r+f (f = 0 in
+//    240p; in 480i f = field ^ FIELD_SWAP ^ CRT_CTRL[0]).
+//  - 15 kHz vertical filter (crt_ctrl[2:1], the CRT_CTRL register): off
+//    shows L[s] raw; 2-tap = (L[s] + L[s+1] + 1) >> 1; 3-tap =
+//    (L[s-1] + 2*L[s] + L[s+1] + 2) >> 2 - per 8-bit channel after depth
+//    expansion, rounded half up, neighbours clamped to source lines
+//    0..SRC_H-1. Each output line's fetch request then becomes a GROUP:
+//    the centre line s into the banks above, then s+1 and s-1 (same render
+//    base, +-1 stride) into two more bank sets at the same buffer parity.
+//    The shared base means a shared sub-beat offset, so all sets are read
+//    at the same address and only the funnel/convert is replicated.
+//    Bypassed for fb_line_dbl (240-line) sources. VFILT_TAPS = 2 builds
+//    without the s-1 set (3-tap then falls back to 2-tap), 0 without any.
 //
 // All video outputs are registered and mutually aligned (2 clk latency
 // from the internal counters). Border pixels are black. Byte 0 of each
@@ -92,7 +109,10 @@ module spg
 	//              runs 263 lines with its vsync half a line later (CEA 480i).
 	// In both 15 kHz modes the window fills all V_ACTIVE lines (no bands).
 	parameter LINE_MODE = 0,
-	parameter FIELD_SWAP = 0         // 480i: 1 = field 0 shows the odd lines
+	parameter FIELD_SWAP = 0,        // 480i: 1 = field 0 shows the odd lines
+	// 15 kHz vertical filter hardware (see header): 3 = 2- and 3-tap,
+	// 2 = 2-tap only, 0 = none. No effect in LINE_MODE 0.
+	parameter VFILT_TAPS = 3
 )
 (
 	input  wire        clk,          // 1080p pixel clock (148.352 / 148.5 MHz)
@@ -115,6 +135,14 @@ module spg
 	input  wire [1:0]  fb_depth,     // FB_R_CTRL.fb_depth: 0=0555 1=565 2=888 3=0888
 	input  wire [2:0]  fb_concat,    // FB_R_CTRL.fb_concat (low bits of 5/6-bit channels)
 	input  wire        fb_enable,    // FB_R_CTRL.fb_enable: 0 = game window black
+
+	// CRT_CTRL (pvr_mmio, another clock domain - synchronised here and
+	// adopted once per field, at the start of vertical blanking):
+	// [0] 480i field swap, xor'ed with FIELD_SWAP; [2:1] 15 kHz vertical
+	// filter 0 = off, 1 = 2-tap, 2 = 3-tap, 3 = 3-tap. Unused in LINE_MODE 0.
+	/* verilator lint_off UNUSEDSIGNAL */
+	input  wire [2:0]  crt_ctrl,
+	/* verilator lint_on UNUSEDSIGNAL */
 
 	// Border bands (see header). BYTE addresses, 128-byte aligned, 0 = off;
 	// sampled once per frame at the start of vertical blanking.
@@ -168,7 +196,17 @@ localparam [10:0] Y0       = M15K ? 11'd0 : (V_ACTIVE - SRC_H*2)/2;        // 60
 localparam [10:0] Y1       = M15K ? V_ACTIVE : (V_ACTIVE - SRC_H*2)/2 + SRC_H*2; // 1020
 localparam [10:0] V_TOTAL1 = V_TOTAL + (ILACE ? 11'd1 : 11'd0);  // 480i field 1: 263
 localparam [11:0] HALF_LN  = H_TOTAL / 2;
-localparam [10:0] LOOK     = M15K ? 11'd1 : 11'd2;   // fetch-ahead, output lines
+localparam [10:0] LOOK     = 11'd2;                  // fetch-ahead, output lines
+// Request point within the line. 1080p: hcnt 2 (see the look cone note).
+// 15 kHz (one buffer per output line, parity = row parity): the target
+// buffer's previous occupant is the CURRENT line, so the request fires just
+// after the window ends - ~1.2 lines of fetch time for up to 3 lines of
+// vertical-filter group, instead of the 1 line of a request at hcnt 2 of
+// the following line.
+localparam [11:0] REQ_H    = M15K ? (H_ACTIVE - SRC_W*2)/2 + SRC_W*2 + 16 : 2;
+localparam        VF2      = M15K && (VFILT_TAPS >= 2); // s+1 tap bank set
+localparam        VF3      = M15K && (VFILT_TAPS >= 3); // s-1 tap bank set
+localparam  [9:0] SRC_LAST = SRC_H - 1;                 // filter clamp line
 
 localparam        BURST_LEN = 16;        // 128-bit beats per burst (256 bytes)
 localparam [7:0]  BC_FULL   = BURST_LEN; // full burstcount
@@ -213,8 +251,27 @@ always @(posedge clk or posedge reset) begin
 		else hcnt <= hcnt + 12'd1;
 	end
 end
-// field whose lines a source-line mapping uses (FIELD_SWAP flips parity)
-wire field_src = ILACE ? (field ^ (FIELD_SWAP != 0)) : 1'b0;
+// CRT_CTRL: 2-flop synchronizer, adopted once per field at the start of
+// vertical blanking (line V_ACT: after the field's last fetch request and
+// before the next field's first one at V_TOTAL-2, so a write never tears a
+// field), and only when two consecutive samples agree (multi-bit bus).
+reg  [2:0] crt_s1  = 3'd0;
+reg  [2:0] crt_s2  = 3'd0;
+reg        fsw_lat = 1'b0;   // runtime field swap (480i only)
+reg  [1:0] vf_lat  = 2'd0;   // vertical filter: 0 off, 1 2-tap, 2 3-tap
+always @(posedge clk) begin
+	crt_s1 <= crt_ctrl;
+	crt_s2 <= crt_s1;
+	if (vcnt == V_ACT && hcnt == 12'd0 && crt_s2 == crt_s1) begin
+		fsw_lat <= ILACE && crt_s2[0];
+		vf_lat  <= (!VF2 || crt_s2[2:1] == 2'd0) ? 2'd0
+		         : (!VF3 || crt_s2[2:1] == 2'd1) ? 2'd1 : 2'd2;
+	end
+end
+
+// field whose lines a source-line mapping uses (FIELD_SWAP / CRT_CTRL[0]
+// flip parity)
+wire field_src = ILACE ? (field ^ (FIELD_SWAP != 0) ^ fsw_lat) : 1'b0;
 
 wire img_v = (vcnt >= Y0) && (vcnt < Y1);
 
@@ -270,15 +327,23 @@ reg  [8:0] req_beats  = 9'd0;   // beats to fetch (game lines; bands use BAND_BE
 reg        req_half   = 1'b0;   // this line's fb_disp_half
 reg        req_step2  = 1'b0;   // advance 2 strides (15 kHz line skip)
 reg        req_init1  = 1'b0;   // first line starts at +1 stride (480i odd field)
+reg  [1:0] req_filt   = 2'd0;   // vertical filter group: 0 centre only, 1 +s+1, 2 +s+1,s-1
+reg        req_first  = 1'b0;   // centre is source line 0 (s-1 clamps to s)
+reg        req_last   = 1'b0;   // centre is source line SRC_H-1 (s+1 clamps to s)
 reg [11:0] last_req   = 12'hFFF;   // {region, src}
 reg  [1:0] cnt_req    = 2'd0;
 
 // sub-beat byte offset of each buffer's line, for the read side
 reg  [3:0] line_roff [0:1];
 initial begin line_roff[0] = 4'd0; line_roff[1] = 4'd0; end
+// filter mode each buffer's line group was fetched with, for the read side
+reg  [1:0] line_filt [0:1];
+initial begin line_filt[0] = 2'd0; line_filt[1] = 2'd0; end
 
-// wraps only for the top band, whose first request lands 2 lines before
-// the raster does (V_TOTAL-2 -> line 0)
+// wraps only for the top band (1080p) / the game window (15 kHz), whose
+// first request lands 2 lines before the raster does (V_TOTAL-2 -> line 0;
+// 15 kHz: rows 0-1 of a field are thus requested before the per-frame
+// config latch at line 0 - a config change fully settles one field later)
 wire [10:0] y_look_raw = vcnt + LOOK;
 wire        look_wrap  = (y_look_raw >= vtot_cur);
 wire [10:0] y_look     = look_wrap ? y_look_raw - vtot_cur : y_look_raw;
@@ -302,6 +367,9 @@ wire  [9:0] look_src = !M15K ? look_shf[9:0]
                      : dbl_lat ? look_rel[9:0]
                                : {look_rel[8:0], look_fld};
 wire [11:0] look_key = {look_rgn, look_src};
+// vertical filter group of this line (vf_lat is 0 outside the 15 kHz
+// modes); bypassed for 240-line sources, where a row IS one source line
+wire  [1:0] look_filt = (look_game && !dbl_lat) ? vf_lat : 2'd0;
 
 // game-line fetch length: whole beats covering the FB-view bytes of one
 // line (raw layout doubles in split mode), +1 for the 888 packed quirk
@@ -338,7 +406,13 @@ reg  [3:0] look_roff_r  = 4'd0;
 reg  [8:0] look_beats_r = 9'd0;
 reg        look_step2_r = 1'b0;   // 15 kHz skip: advance 2 source lines per request
 reg        look_init1_r = 1'b0;   // 480i odd field: region starts 1 source line in
+reg  [1:0] look_filt_r  = 2'd0;
+reg        look_first_r = 1'b0;
+reg        look_last_r  = 1'b0;
 always @(posedge clk) begin
+	look_filt_r  <= look_filt;
+	look_first_r <= (look_src == 10'd0);
+	look_last_r  <= (look_src == SRC_LAST);
 	look_in_r    <= look_in;
 	look_key_r   <= look_key;
 	look_rgn_r   <= look_rgn;
@@ -377,7 +451,7 @@ always @(posedge clk or posedge reset) begin
 			last_req     <= 12'hFFF;
 		end
 
-		if (hcnt == 12'd2 && look_in_r && look_key_r != last_req) begin
+		if (hcnt == REQ_H && look_in_r && look_key_r != last_req) begin
 			req_sof    <= look_sof_r;
 			req_buf    <= look_buf_r;
 			req_region <= look_rgn_r;
@@ -386,7 +460,11 @@ always @(posedge clk or posedge reset) begin
 			req_beats  <= look_beats_r;
 			req_step2  <= look_step2_r;
 			req_init1  <= look_init1_r;
+			req_filt   <= look_filt_r;
+			req_first  <= look_first_r;
+			req_last   <= look_last_r;
 			line_roff[look_buf_r] <= look_game_r ? look_roff_r : 4'd0;
+			line_filt[look_buf_r] <= look_filt_r;
 			last_req   <= look_key_r;
 			cnt_req    <= cnt_req + 2'd1;
 			req_toggle <= ~req_toggle;   // payload above is stable when this lands
@@ -410,8 +488,27 @@ reg        done_toggle = 1'b0;
 reg        cur_split   = 1'b0;   // this fetch's layout: only game can be split
 reg        cur_half    = 1'b0;   // ... and only game selects a 32-bit half
 
+// 15 kHz vertical filter group: after the centre line (tap 0, the line an
+// unfiltered request fetches) come s+1 (tap 1) and s-1 (tap 2), each a full
+// line fetch of the same length into its own bank set at the same buffer
+// parity. The group's payload is latched at its start; the next tap's
+// start address is a registered base +- one stride (clamped at the source
+// edges), settled long before the current line's last beat.
+reg  [1:0] cur_tap     = 2'd0;   // line of the group being fetched
+reg        grp_buf     = 1'b0;   // target buffer (the payload's req_buf moves on
+                                 // with the next request, which a long fetch
+                                 // can overlap)
+reg  [1:0] grp_filt    = 2'd0;
+reg        grp_first   = 1'b0;
+reg        grp_last    = 1'b0;
+reg  [8:0] grp_beats   = 9'd0;
+reg [27:0] grp_addr    = 28'd0;  // centre line's start address
+reg [27:0] tap_addr    = 28'd0;  // next tap line's start address
+
 wire req_edge = rt_sync[2] ^ rt_sync[1];
 wire req_game = (req_region == RGN_GAME);
+wire tap_more = (VF2 && cur_tap == 2'd0 && grp_filt != 2'd0) ||
+                (VF3 && cur_tap == 2'd1 && grp_filt == 2'd2);
 
 // requests never interleave regions: line_off accumulates within one region
 // and req_sof zeroes it at the region's first line. Bands are still
@@ -429,6 +526,9 @@ always @(posedge avl_clk) begin : fetch_fsm
 	rt_sync  <= {rt_sync[1:0], req_toggle};
 
 	if (avl_read && !avl_waitrequest) avl_read <= 1'b0;   // command accepted
+
+	tap_addr <= (cur_tap == 2'd0) ? grp_addr + (grp_last  ? 28'd0 : {17'd0, adv_lat})
+	                              : grp_addr - (grp_first ? 28'd0 : {17'd0, adv_lat});
 
 	if (req_edge && fetching) pending <= 1'b1;
 
@@ -449,6 +549,13 @@ always @(posedge avl_clk) begin : fetch_fsm
 		cur_half       <= req_half;
 		w              <= 9'd0;
 		fetching       <= 1'b1;
+		cur_tap        <= 2'd0;
+		grp_buf        <= req_buf;
+		grp_addr       <= na;
+		grp_filt       <= req_game ? req_filt : 2'd0;
+		grp_first      <= req_first;
+		grp_last       <= req_last;
+		grp_beats      <= req_beats;
 	end
 	else if (fetching && avl_readdatavalid) begin
 		w           <= w + 9'd1;
@@ -456,7 +563,19 @@ always @(posedge avl_clk) begin : fetch_fsm
 		burst_beats <= burst_beats - 5'd1;
 		if (burst_beats == 5'd1) begin                    // last beat of this burst
 			rem = beats_left - 9'd1;
-			if (rem == 9'd0) begin
+			if (rem == 9'd0 && tap_more) begin
+				// line done, the group's next tap line starts (same
+				// serialization as a burst: the command follows the
+				// previous burst's last beat)
+				cur_tap        <= cur_tap + 2'd1;
+				avl_address    <= tap_addr;
+				avl_burstcount <= BC_FULL;
+				avl_read       <= 1'b1;
+				burst_beats    <= BB_FULL;
+				beats_left     <= grp_beats;
+				w              <= 9'd0;
+			end
+			else if (rem == 9'd0) begin
 				fetching    <= 1'b0;
 				done_toggle <= ~done_toggle;
 			end
@@ -489,6 +608,10 @@ end
 //           beat[64h +: 64]
 // (No head/tail trimming: a misaligned base's padding bytes are stored
 // and skipped by the read side's byte offset.)
+//
+// 15 kHz vertical filter: two more bank sets of the same shape hold the
+// group's s+1 (tap 1) and s-1 (tap 2) lines; the write side just steers by
+// cur_tap, the read side shares the centre set's registered address.
 //////////////////////////////////////////////////////////////////////////
 
 wire [10:0] base_n = cur_split ? {1'b0, w, 1'b0} : {w, 2'b00};
@@ -496,6 +619,9 @@ wire [10:0] base_n = cur_split ? {1'b0, w, 1'b0} : {w, 2'b00};
 wire  [9:0] w0_pre;   // display-side window word (declared ahead of use)
 wire        rbuf;
 wire [31:0] rq [0:3];
+wire [31:0] rqp [0:3];   // tap 1: s+1
+wire [31:0] rqm [0:3];   // tap 2: s-1
+wire        tap_we = fetching && avl_readdatavalid;
 
 generate
 genvar gb;
@@ -519,7 +645,7 @@ for (gb = 0; gb < 4; gb = gb + 1) begin : bank
 	wire [31:0] wd   = cur_split ? (cur_half ? h64[63:32] : h64[31:0]) : w32;
 
 	always @(posedge avl_clk) begin
-		if (fetching && avl_readdatavalid && ok) mem[{req_buf, n[9:2]}] <= wd;
+		if (tap_we && ok && cur_tap == 2'd0) mem[{grp_buf, n[9:2]}] <= wd;
 	end
 
 	// read side: this bank holds the unique word of the sliding window
@@ -533,6 +659,32 @@ for (gb = 0; gb < 4; gb = gb + 1) begin : bank
 		q    <= mem[radr];
 	end
 	assign rq[gb] = q;
+
+	// vertical filter tap sets (15 kHz builds only)
+	if (VF2) begin : tap_p
+		reg [31:0] mem_p [0:511];
+		reg [31:0] q_p = 32'd0;
+		always @(posedge avl_clk) begin
+			if (tap_we && ok && cur_tap == 2'd1) mem_p[{grp_buf, n[9:2]}] <= wd;
+		end
+		always @(posedge clk) q_p <= mem_p[radr];
+		assign rqp[gb] = q_p;
+	end
+	else begin : no_tap_p
+		assign rqp[gb] = 32'd0;
+	end
+	if (VF3) begin : tap_m
+		reg [31:0] mem_m [0:511];
+		reg [31:0] q_m = 32'd0;
+		always @(posedge avl_clk) begin
+			if (tap_we && ok && cur_tap == 2'd2) mem_m[{grp_buf, n[9:2]}] <= wd;
+		end
+		always @(posedge clk) q_m <= mem_m[radr];
+		assign rqm[gb] = q_m;
+	end
+	else begin : no_tap_m
+		assign rqm[gb] = 32'd0;
+	end
 end
 endgenerate
 
@@ -571,12 +723,14 @@ reg  [1:0] disp_dep_r = 2'd0;
 reg  [3:0] roff_r     = 4'd0;
 reg        rbuf_r     = 1'b0;
 reg        pd_sel_r   = 1'b0;
+reg  [1:0] filt_r     = 2'd0;   // vertical filter of this line's group
 always @(posedge clk) begin
 	band_v_r   <= band_v;
 	disp_dep_r <= band_v ? 2'd1 : dep_lat;   // bands read as 16bpp
 	roff_r     <= band_v ? 4'd0 : line_roff[dbuf];
 	rbuf_r     <= dbuf;
 	pd_sel_r   <= pd_lat && !band_v;
+	filt_r     <= band_v ? 2'd0 : line_filt[dbuf];
 end
 assign rbuf = rbuf_r;
 
@@ -631,6 +785,39 @@ reg [1:0] s1_w0lo = 2'd0, s2_w0lo = 2'd0;   // window rotation, piped with the R
 reg [1:0] s1_blo  = 2'd0, s2_blo  = 2'd0;   // byte offset within the window
 reg [4:0] pipe1   = 5'd0;   // {img, de, hs, vs, vbl}
 
+// Stage-2 pixel extraction from one bank set's four RAM words: rotate the
+// window, funnel the pixel's bytes down, convert to {R8, G8, B8}.
+function [23:0] px_rgb;
+	input [31:0] q0, q1, q2, q3;   // bank 0..3 read data
+	input  [1:0] w0lo;             // window rotation
+	input  [1:0] blo;              // byte offset within the window
+	input        band;             // bands: 565, MSB-replicated
+	input  [1:0] dep;
+	input  [2:0] cat;
+	reg   [31:0] wlo, whi;
+	reg   [63:0] s64;
+	reg   [31:0] p32;
+	reg   [15:0] p16;
+	begin
+		case (w0lo)
+			2'd0:    begin wlo = q0; whi = q1; end
+			2'd1:    begin wlo = q1; whi = q2; end
+			2'd2:    begin wlo = q2; whi = q3; end
+			default: begin wlo = q3; whi = q0; end
+		endcase
+		s64 = {whi, wlo} >> {blo, 3'b000};
+		p32 = s64[31:0];
+		p16 = p32[15:0];
+		if (band)
+			px_rgb = {p16[15:11], p16[15:13], p16[10:5], p16[10:9], p16[4:0], p16[4:2]};
+		else case (dep)
+			2'd0:    px_rgb = {p16[14:10], cat, p16[9:5], cat, p16[4:0], cat};         // 0555 + fb_concat
+			2'd1:    px_rgb = {p16[15:11], cat, p16[10:5], cat[2:1], p16[4:0], cat};  // 565 + fb_concat
+			default: px_rgb = p32[23:0];   // 888 packed / 0888: R,G,B = bytes 2,1,0
+		endcase
+	end
+endfunction
+
 always @(posedge clk) begin
 	// stage 0/1 companions of the RAM pipeline in the generate above
 	s1_w0lo <= w0_pre[1:0];
@@ -640,41 +827,33 @@ always @(posedge clk) begin
 	pipe1   <= {img_c, de_c, hs_c, vs_c, vbl_c};
 
 	// stage 2: rotate the window, funnel the pixel's bytes down, convert.
-	// dep_lat/cat_lat/en_lat/band_v_r are line-constant, so using them
-	// "late" is safe (the affected edge pixels are border-black).
+	// dep_lat/cat_lat/en_lat/band_v_r/filt_r are line-constant, so using
+	// them "late" is safe (the affected edge pixels are border-black).
 	begin : lane_mux
-		reg [31:0] wlo, whi;
-		reg [63:0] s64;
-		reg [31:0] p32;
-		reg [15:0] p16;
+		reg [23:0] cx, cp, cm;       // centre line s, s+1, s-1
+		reg  [8:0] a2r, a2g, a2b;    // 2-tap sums
+		reg  [9:0] a3r, a3g, a3b;    // 3-tap sums
 		reg  [7:0] r8, g8, b8;
-		wlo = rq[s2_w0lo];
-		whi = rq[s2_w0lo + 2'd1];
-		s64 = {whi, wlo} >> {s2_blo, 3'b000};
-		p32 = s64[31:0];
-		p16 = p32[15:0];
-		if (band_v_r) begin                  // bands: 565, MSB-replicated
-			r8 = {p16[15:11], p16[15:13]};
-			g8 = {p16[10:5],  p16[10:9]};
-			b8 = {p16[4:0],   p16[4:2]};
-		end
-		else case (dep_lat)
-			2'd0: begin                      // 0555, fb_concat appended
-				r8 = {p16[14:10], cat_lat};
-				g8 = {p16[9:5],   cat_lat};
-				b8 = {p16[4:0],   cat_lat};
-			end
-			2'd1: begin                      // 565, fb_concat appended
-				r8 = {p16[15:11], cat_lat};
-				g8 = {p16[10:5],  cat_lat[2:1]};
-				b8 = {p16[4:0],   cat_lat};
-			end
-			default: begin                   // 888 packed / 0888: R,G,B = bytes 2,1,0
-				r8 = p32[23:16];
-				g8 = p32[15:8];
-				b8 = p32[7:0];
-			end
-		endcase
+		cx = px_rgb(rq[0],  rq[1],  rq[2],  rq[3],  s2_w0lo, s2_blo, band_v_r, dep_lat, cat_lat);
+		// 15 kHz vertical filter taps (one base per group, so every set
+		// shares the window rotation and byte offset); rounding half up.
+		// Constant zero - hence pruned - without the tap sets (LINE_MODE 0).
+		cp = px_rgb(rqp[0], rqp[1], rqp[2], rqp[3], s2_w0lo, s2_blo, 1'b0, dep_lat, cat_lat);
+		cm = px_rgb(rqm[0], rqm[1], rqm[2], rqm[3], s2_w0lo, s2_blo, 1'b0, dep_lat, cat_lat);
+		// 2-tap: (s + s+1 + 1) >> 1
+		a2r = {1'b0, cx[23:16]} + {1'b0, cp[23:16]} + 9'd1;
+		a2g = {1'b0, cx[15:8]}  + {1'b0, cp[15:8]}  + 9'd1;
+		a2b = {1'b0, cx[7:0]}   + {1'b0, cp[7:0]}   + 9'd1;
+		// 3-tap: (s-1 + 2s + s+1 + 2) >> 2
+		a3r = {2'd0, cm[23:16]} + {1'b0, cx[23:16], 1'b0} + {2'd0, cp[23:16]} + 10'd2;
+		a3g = {2'd0, cm[15:8]}  + {1'b0, cx[15:8],  1'b0} + {2'd0, cp[15:8]}  + 10'd2;
+		a3b = {2'd0, cm[7:0]}   + {1'b0, cx[7:0],   1'b0} + {2'd0, cp[7:0]}   + 10'd2;
+		if (VF3 && filt_r == 2'd2)
+			{r8, g8, b8} = {a3r[9:2], a3g[9:2], a3b[9:2]};
+		else if (VF2 && filt_r != 2'd0)
+			{r8, g8, b8} = {a2r[8:1], a2g[8:1], a2b[8:1]};
+		else
+			{r8, g8, b8} = cx;
 		if (pipe1[4] && (band_v_r || en_lat)) begin
 			red   <= r8;
 			green <= g8;

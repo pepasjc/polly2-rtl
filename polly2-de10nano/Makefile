@@ -21,7 +21,7 @@ TSP_PKG = ../polly2-core/rtl/gen/tsp_pkg.sv
 # polly2-core video-out (framebuffer write master) instantiated by simplex_pvr_top
 VO_RTL  = ../polly2-core/rtl/vo.sv
 
-all: spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p fb-write render-irq
+all: spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p spg-15k fb-write render-irq
 
 #   make fb-write - FB write master formats: every FB_W_CTRL packmode
 #                   (0555K/565/4444/1555/888/0888K/8888, refsw2 dither
@@ -82,6 +82,37 @@ obj_dir/spg_bands_tb: rtl/spg.sv tb/spg_bands_tb.cpp
 spg-sync: obj_dir/spg_sync_tb
 	./obj_dir/spg_sync_tb
 
+#   make spg-15k   - 15 kHz CRT modes on the CRT build's 1716 x 262 raster
+#                    (LINE_MODE 1 = 240p, 2 = 480i): line/field timing, 480i
+#                    half-line vsync + measured top-field parity, every pixel
+#                    vs a model over fb_depth / pixel_double / 240-line
+#                    sources, CRT_CTRL field swap and 2/3-tap vertical
+#                    filter (exact model incl. edge clamp and rounding),
+#                    CRT_CTRL adopted at field boundaries only, no underrun
+#                    at the 0888 3-tap worst case; plus a 480i build with
+#                    FIELD_SWAP=1 and VFILT_TAPS=2 (2-tap-only hardware)
+SPG15K_V = mkdir -p obj_dir && $(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-UNSIGNED \
+           -GH_ACTIVE=1440 -GH_FP=38 -GH_SYNC=124 -GH_BP=114 \
+           -GV_ACTIVE=240 -GV_FP=4 -GV_SYNC=3 -GV_BP=15
+
+spg-15k: obj_dir/spg15k_1/spg_15k_tb obj_dir/spg15k_2/spg_15k_tb obj_dir/spg15k_2s/spg_15k_tb
+	./obj_dir/spg15k_1/spg_15k_tb
+	./obj_dir/spg15k_2/spg_15k_tb
+	./obj_dir/spg15k_2s/spg_15k_tb
+
+obj_dir/spg15k_1/spg_15k_tb: rtl/spg.sv tb/spg_15k_tb.cpp
+	$(SPG15K_V) -GLINE_MODE=1 -CFLAGS -DLMODE=1 --Mdir obj_dir/spg15k_1 \
+	    rtl/spg.sv tb/spg_15k_tb.cpp -o spg_15k_tb
+
+obj_dir/spg15k_2/spg_15k_tb: rtl/spg.sv tb/spg_15k_tb.cpp
+	$(SPG15K_V) -GLINE_MODE=2 -CFLAGS -DLMODE=2 --Mdir obj_dir/spg15k_2 \
+	    rtl/spg.sv tb/spg_15k_tb.cpp -o spg_15k_tb
+
+obj_dir/spg15k_2s/spg_15k_tb: rtl/spg.sv tb/spg_15k_tb.cpp
+	$(SPG15K_V) -GLINE_MODE=2 -GFIELD_SWAP=1 -GVFILT_TAPS=2 \
+	    -CFLAGS "-DLMODE=2 -DFSWAP=1 -DVFT=2" --Mdir obj_dir/spg15k_2s \
+	    rtl/spg.sv tb/spg_15k_tb.cpp -o spg_15k_tb
+
 #   make audio-i2s - MMIO AUDIO_DATA -> 2048-entry async FIFO -> I2S:
 #                    framing/order/one-shot delivery, blocking-write
 #                    backpressure when full, non-audio accesses unaffected,
@@ -127,4 +158,4 @@ obj_dir/pvr_burst_tb: rtl/simplex_pvr_top.sv $(VO_RTL) tb/peel_core_stub.sv tb/p
 clean:
 	rm -rf obj_dir
 
-.PHONY: all spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p fb-write render-irq clean
+.PHONY: all spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p spg-15k fb-write render-irq clean

@@ -60,7 +60,28 @@
 //                            to every audio output. Power-up AUD_ATT_INIT.
 //                            (CRT builds; on the r6-based CRT builds it
 //                            sits at 0xFF202028, REVISION 3.)
-//   0xFF202034 - 0xFF20203C  reserved (read 0, writes ignored).
+//   0xFF202034  CRT_CTRL     RW. 15 kHz (CRT_LINE_MODE) display options,
+//                            adopted by the SPG once per field at the start
+//                            of vertical blanking. Power-up 0. No effect on
+//                            the 1080p (non-CRT) builds.
+//                            [0]   FIELD_SWAP: 480i field parity (240p
+//                                  ignores it), xor'ed with the build's
+//                                  CRT_FIELD_SWAP. Without that define: 0 =
+//                                  the field drawn half a line HIGHER on a
+//                                  CRT (the one after the hsync-aligned
+//                                  vsync; its own vsync is the half-line-late
+//                                  one) shows the odd source lines - the
+//                                  original mapping; 1 = it shows the even
+//                                  lines (0, 2, ...), i.e. line 0 on top.
+//                            [2:1] VFILT: vertical filter for 480-line
+//                                  framebuffers (240-line sources bypass it):
+//                                  0 = off (raw lines, 480i alternates them),
+//                                  1 = 2-tap [1 1]/2, 2 = 3-tap [1 2 1]/4
+//                                  (flicker filter; in 240p a real 480->240
+//                                  downscale instead of dropping lines),
+//                                  3 = reserved (acts as 2).
+//                            Other bits reserved, write 0.
+//   0xFF202038 - 0xFF20203C  reserved (read 0, writes ignored).
 //
 // Single clock domain (clk_sys). waitrequest is low except for AUDIO_DATA
 // writes with the FIFO full - every other access completes immediately;
@@ -107,7 +128,10 @@ module pvr_mmio
 	// SPG border band framebuffers (128-byte-aligned byte addr, 0 = off)
 	output reg  [31:0] fb_top    = 32'd0,
 	output reg  [31:0] fb_bot    = 32'd0,
-	output reg  [31:0] vram_cfg  = 32'd0     // [0] VRAM_16MB (0 = 8 MB + mirror)
+	output reg  [31:0] vram_cfg  = 32'd0,    // [0] VRAM_16MB (0 = 8 MB + mirror)
+
+	// CRT_CTRL: SPG 15 kHz options ([0] field swap, [2:1] vertical filter)
+	output reg   [2:0] crt_ctrl  = 3'd0
 );
 
 // no size casts (Quartus Standard 17.0)
@@ -183,6 +207,7 @@ always @(posedge clk) begin
 			4'd9: fb_bot <= {avs_writedata[31:7], 7'd0};   // FB_BOT
 			4'd10: vram_cfg <= {31'd0, avs_writedata[0]};  // VRAM_CFG
 			4'd12: aud_att <= avs_writedata[4:0];          // AUDIO_VOL
+			4'd13: crt_ctrl <= avs_writedata[2:0];         // CRT_CTRL
 			default: ;                                     // STATUS/CYCLES/rsvd: RO
 		endcase
 	end
@@ -215,6 +240,7 @@ always @(posedge clk) begin
 			4'd9: avs_readdata <= fb_bot;                  // FB_BOT
 			4'd10: avs_readdata <= vram_cfg;               // VRAM_CFG
 			4'd12: avs_readdata <= {27'd0, aud_att};       // AUDIO_VOL
+			4'd13: avs_readdata <= {29'd0, crt_ctrl};      // CRT_CTRL
 			default: ;
 		endcase
 	end
