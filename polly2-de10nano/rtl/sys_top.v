@@ -341,7 +341,7 @@ wire [11:0] aud_fifo_level;
 wire  [4:0] aud_att;
 
 wire [31:0] fb_top_base, fb_bot_base;
-wire  [2:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
+wire  [3:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
 
 pvr_mmio
 `ifdef CRT_LINE_MODE
@@ -616,7 +616,8 @@ wire [23:0] hdmi_data;
 wire        hdmi_hs, hdmi_vs, hdmi_de, hdmi_vbl, hdmi_brd;
 wire        spg_underrun;
 
-// CRT build: `define CRT_LINE_MODE 1 (240p) / 2 (480i) selects a 15 kHz
+// CRT build: `define CRT_LINE_MODE 1 (240p) / 2 (480i) / 3 (either, picked
+// at run time by CRT_CTRL[3]) selects a 15 kHz
 // 1440-wide raster at the 27 MHz pll_hdmi (MiSTercade / direct-video DACs).
 spg
 `ifdef CRT_LINE_MODE

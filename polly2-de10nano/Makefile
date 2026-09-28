@@ -95,10 +95,22 @@ SPG15K_V = mkdir -p obj_dir && $(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-UN
            -GH_ACTIVE=1440 -GH_FP=38 -GH_SYNC=124 -GH_BP=114 \
            -GV_ACTIVE=240 -GV_FP=4 -GV_SYNC=3 -GV_BP=15
 
-spg-15k: obj_dir/spg15k_1/spg_15k_tb obj_dir/spg15k_2/spg_15k_tb obj_dir/spg15k_2s/spg_15k_tb
+spg-15k: obj_dir/spg15k_1/spg_15k_tb obj_dir/spg15k_2/spg_15k_tb obj_dir/spg15k_2s/spg_15k_tb \
+         obj_dir/spg15k_3p/spg_15k_tb obj_dir/spg15k_3i/spg_15k_tb
 	./obj_dir/spg15k_1/spg_15k_tb
 	./obj_dir/spg15k_2/spg_15k_tb
 	./obj_dir/spg15k_2s/spg_15k_tb
+	./obj_dir/spg15k_3p/spg_15k_tb
+	./obj_dir/spg15k_3i/spg_15k_tb
+
+# LINE_MODE 3 (240p / 480i picked by CRT_CTRL[3]) must match modes 1 and 2
+obj_dir/spg15k_3p/spg_15k_tb: rtl/spg.sv tb/spg_15k_tb.cpp
+	$(SPG15K_V) -GLINE_MODE=3 -CFLAGS "-DLMODE=1 -DRTLMODE=3" --Mdir obj_dir/spg15k_3p \
+	    rtl/spg.sv tb/spg_15k_tb.cpp -o spg_15k_tb
+
+obj_dir/spg15k_3i/spg_15k_tb: rtl/spg.sv tb/spg_15k_tb.cpp
+	$(SPG15K_V) -GLINE_MODE=3 -CFLAGS "-DLMODE=2 -DRTLMODE=3" --Mdir obj_dir/spg15k_3i \
+	    rtl/spg.sv tb/spg_15k_tb.cpp -o spg_15k_tb
 
 obj_dir/spg15k_1/spg_15k_tb: rtl/spg.sv tb/spg_15k_tb.cpp
 	$(SPG15K_V) -GLINE_MODE=1 -CFLAGS -DLMODE=1 --Mdir obj_dir/spg15k_1 \

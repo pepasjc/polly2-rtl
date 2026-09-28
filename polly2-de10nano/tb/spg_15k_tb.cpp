@@ -35,6 +35,12 @@
 #ifndef LMODE
 #define LMODE 2
 #endif
+// RTLMODE 3: the DUT is the run-time-switchable build (-GLINE_MODE=3); LMODE
+// then says which mode CRT_CTRL[3] selects and the expectations follow it
+#ifndef RTLMODE
+#define RTLMODE LMODE
+#endif
+#define CRT_P240 ((RTLMODE == 3 && LMODE == 1) ? 8 : 0)
 #ifndef FSWAP
 #define FSWAP 0
 #endif
@@ -142,7 +148,7 @@ static bool apply(const Cfg& c) {   // true when a per-frame (non-CRT_CTRL) inpu
     g = c;
     dut->fb_base = g.base_fb * 2; dut->fb_stride = (g.pd ? 320 : 640) * bpp(g.depth);
     dut->fb_depth = g.depth; dut->fb_concat = g.concat; dut->fb_pix_dbl = g.pd; dut->fb_line_dbl = g.dbl;
-    dut->crt_ctrl = g.crt;
+    dut->crt_ctrl = g.crt | CRT_P240;
     if (g.stress) { avl_ps = CLK_PS; ddr_lat = 0; t_avl = t_clk; }
     return ch;
 }
@@ -209,7 +215,7 @@ int main(int argc, char** argv) {
                 if (cy == 0 && last_vs >= 0 && field_idx >= 2) vs2pic[field_idx & 1] = t - last_vs;
             }
             gap = 0;
-            if (checked && case_field == 0 && g.mid_crt >= 0 && cy == 100 && cx == 0) dut->crt_ctrl = g.crt = g.mid_crt;
+            if (checked && case_field == 0 && g.mid_crt >= 0 && cy == 100 && cx == 0) dut->crt_ctrl = (g.crt = g.mid_crt) | CRT_P240;
             if (checked && cy >= 0) {
                 int e[3]; expect_px(cx, cy, field_idx & 1, e);
                 if (dut->red != e[0] || dut->green != e[1] || dut->blue != e[2]) {
@@ -258,6 +264,7 @@ int main(int argc, char** argv) {
         if (vs2pic[0] - vs2pic[1] != H_TOT / 2 && vs2pic[1] - vs2pic[0] != H_TOT / 2) { printf("fields not half a line apart\n"); errors++; }
     }
     if (dut->underrun && !under_seen) { printf("UNDERRUN\n"); errors++; }
-    printf("LINE_MODE %d FIELD_SWAP %d VFILT_TAPS %d: %d fields, %s (%d errors)\n", LMODE, FSWAP, VFT, field_idx, errors ? "FAIL" : "PASS", errors);
+    printf("LINE_MODE %d%s FIELD_SWAP %d VFILT_TAPS %d: %d fields, %s (%d errors)\n", LMODE,
+           RTLMODE == 3 ? " (run-time, LINE_MODE 3)" : "", FSWAP, VFT, field_idx, errors ? "FAIL" : "PASS", errors);
     dut->final(); delete dut; return errors ? 1 : 0;
 }

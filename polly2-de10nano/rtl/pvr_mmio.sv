@@ -80,6 +80,9 @@
 //                                  (flicker filter; in 240p a real 480->240
 //                                  downscale instead of dropping lines),
 //                                  3 = reserved (acts as 2).
+//                            [3]   P240: CRT_LINE_MODE=3 builds only - 1 =
+//                                  240p, 0 = 480i (ignored by the fixed-mode
+//                                  builds).
 //                            Other bits reserved, write 0.
 //   0xFF202038 - 0xFF20203C  reserved (read 0, writes ignored).
 //
@@ -131,7 +134,7 @@ module pvr_mmio
 	output reg  [31:0] vram_cfg  = 32'd0,    // [0] VRAM_16MB (0 = 8 MB + mirror)
 
 	// CRT_CTRL: SPG 15 kHz options ([0] field swap, [2:1] vertical filter)
-	output reg   [2:0] crt_ctrl  = 3'd0
+	output reg   [3:0] crt_ctrl  = 4'd0
 );
 
 // no size casts (Quartus Standard 17.0)
@@ -207,7 +210,7 @@ always @(posedge clk) begin
 			4'd9: fb_bot <= {avs_writedata[31:7], 7'd0};   // FB_BOT
 			4'd10: vram_cfg <= {31'd0, avs_writedata[0]};  // VRAM_CFG
 			4'd12: aud_att <= avs_writedata[4:0];          // AUDIO_VOL
-			4'd13: crt_ctrl <= avs_writedata[2:0];         // CRT_CTRL
+			4'd13: crt_ctrl <= avs_writedata[3:0];         // CRT_CTRL
 			default: ;                                     // STATUS/CYCLES/rsvd: RO
 		endcase
 	end
@@ -240,7 +243,7 @@ always @(posedge clk) begin
 			4'd9: avs_readdata <= fb_bot;                  // FB_BOT
 			4'd10: avs_readdata <= vram_cfg;               // VRAM_CFG
 			4'd12: avs_readdata <= {27'd0, aud_att};       // AUDIO_VOL
-			4'd13: avs_readdata <= {29'd0, crt_ctrl};      // CRT_CTRL
+			4'd13: avs_readdata <= {28'd0, crt_ctrl};      // CRT_CTRL
 			default: ;
 		endcase
 	end

@@ -107,6 +107,8 @@ module spg
 	//              source shows its even lines, a 240-line source every line.
 	// LINE_MODE 2: 15 kHz 480i - like 1, but field 1 shows the odd lines and
 	//              runs 263 lines with its vsync half a line later (CEA 480i).
+	// LINE_MODE 3: 15 kHz, 480i or 240p picked at run time by CRT_CTRL[3]
+	//              (0 = 480i, 1 = 240p), so one bitstream serves both.
 	// In both 15 kHz modes the window fills all V_ACTIVE lines (no bands).
 	parameter LINE_MODE = 0,
 	parameter FIELD_SWAP = 0,        // 480i: 1 = field 0 shows the odd lines
@@ -139,9 +141,10 @@ module spg
 	// CRT_CTRL (pvr_mmio, another clock domain - synchronised here and
 	// adopted once per field, at the start of vertical blanking):
 	// [0] 480i field swap, xor'ed with FIELD_SWAP; [2:1] 15 kHz vertical
-	// filter 0 = off, 1 = 2-tap, 2 = 3-tap, 3 = 3-tap. Unused in LINE_MODE 0.
+	// filter 0 = off, 1 = 2-tap, 2 = 3-tap, 3 = 3-tap; [3] LINE_MODE 3 only:
+	// 1 = 240p, 0 = 480i. Unused in LINE_MODE 0.
 	/* verilator lint_off UNUSEDSIGNAL */
-	input  wire [2:0]  crt_ctrl,
+	input  wire [3:0]  crt_ctrl,
 	/* verilator lint_on UNUSEDSIGNAL */
 
 	// Border bands (see header). BYTE addresses, 128-byte aligned, 0 = off;
@@ -191,7 +194,7 @@ localparam [10:0] V_ACT    = V_ACTIVE;
 localparam [11:0] X0       = (H_ACTIVE - SRC_W*2)/2;        // 320
 localparam [11:0] X1       = (H_ACTIVE - SRC_W*2)/2 + SRC_W*2; // 1600
 localparam        M15K     = (LINE_MODE != 0);
-localparam        ILACE    = (LINE_MODE == 2);
+localparam        ILACE    = (LINE_MODE >= 2);  // interlace possible
 localparam [10:0] Y0       = M15K ? 11'd0 : (V_ACTIVE - SRC_H*2)/2;        // 60
 localparam [10:0] Y1       = M15K ? V_ACTIVE : (V_ACTIVE - SRC_H*2)/2 + SRC_H*2; // 1020
 localparam [10:0] V_TOTAL1 = V_TOTAL + (ILACE ? 11'd1 : 11'd0);  // 480i field 1: 263
@@ -231,6 +234,11 @@ localparam [1:0] RGN_BOT  = 2'd2;
 reg [11:0] hcnt = 12'd0;
 reg [10:0] vcnt = 11'd0;
 reg        field = 1'b0;          // 480i field (always 0 otherwise)
+// interlaced right now: LINE_MODE 2 always, LINE_MODE 3 unless CRT_CTRL[3]
+// asked for 240p (adopted at vblank with the other CRT_CTRL bits; a switch to
+// 240p lets the running field finish, then field stays 0)
+reg         p240_q  = 1'b0;
+wire        ilace   = ILACE && !p240_q;
 wire [10:0] vtot_cur = field ? V_TOTAL1 : V_TOTAL;
 
 always @(posedge clk or posedge reset) begin
@@ -244,7 +252,7 @@ always @(posedge clk or posedge reset) begin
 			hcnt <= 12'd0;
 			if (vcnt == vtot_cur - 11'd1) begin
 				vcnt  <= 11'd0;
-				if (ILACE) field <= ~field;
+				field <= ilace ? ~field : 1'b0;
 			end
 			else vcnt <= vcnt + 11'd1;
 		end
@@ -255,8 +263,8 @@ end
 // vertical blanking (line V_ACT: after the field's last fetch request and
 // before the next field's first one at V_TOTAL-2, so a write never tears a
 // field), and only when two consecutive samples agree (multi-bit bus).
-reg  [2:0] crt_s1  = 3'd0;
-reg  [2:0] crt_s2  = 3'd0;
+reg  [3:0] crt_s1  = 4'd0;
+reg  [3:0] crt_s2  = 4'd0;
 reg        fsw_lat = 1'b0;   // runtime field swap (480i only)
 reg  [1:0] vf_lat  = 2'd0;   // vertical filter: 0 off, 1 2-tap, 2 3-tap
 always @(posedge clk) begin
@@ -264,6 +272,7 @@ always @(posedge clk) begin
 	crt_s2 <= crt_s1;
 	if (vcnt == V_ACT && hcnt == 12'd0 && crt_s2 == crt_s1) begin
 		fsw_lat <= ILACE && crt_s2[0];
+		p240_q  <= (LINE_MODE == 3) && crt_s2[3];
 		vf_lat  <= (!VF2 || crt_s2[2:1] == 2'd0) ? 2'd0
 		         : (!VF3 || crt_s2[2:1] == 2'd1) ? 2'd1 : 2'd2;
 	end
@@ -271,7 +280,7 @@ end
 
 // field whose lines a source-line mapping uses (FIELD_SWAP / CRT_CTRL[0]
 // flip parity)
-wire field_src = ILACE ? (field ^ (FIELD_SWAP != 0) ^ fsw_lat) : 1'b0;
+wire field_src = ilace ? (field ^ (FIELD_SWAP != 0) ^ fsw_lat) : 1'b0;
 
 wire img_v = (vcnt >= Y0) && (vcnt < Y1);
 
@@ -347,7 +356,7 @@ initial begin line_filt[0] = 2'd0; line_filt[1] = 2'd0; end
 wire [10:0] y_look_raw = vcnt + LOOK;
 wire        look_wrap  = (y_look_raw >= vtot_cur);
 wire [10:0] y_look     = look_wrap ? y_look_raw - vtot_cur : y_look_raw;
-wire        look_fld   = ILACE ? (field_src ^ look_wrap) : 1'b0;
+wire        look_fld   = ilace ? (field_src ^ look_wrap) : 1'b0;
 
 wire        look_top  = (y_look < Y0) && top_en_lat;
 wire        look_game = (y_look >= Y0) && (y_look < Y1);
@@ -771,7 +780,7 @@ wire hs_c  = (hcnt >= HS_BEG) && (hcnt < HS_END);
 // which some HDMI sinks reject as an unsupported mode.
 // 480i field 1: the whole vsync pulse sits half a line later (edges at
 // HS_BEG + H_TOTAL/2, i.e. mid-line of the following line) -> 262.5-line fields
-wire        vs_half = ILACE && field;
+wire        vs_half = ilace && field;
 wire [10:0] vs_b    = vs_half ? VS_BEG + 11'd1 : VS_BEG;
 wire [10:0] vs_e    = vs_half ? VS_END + 11'd1 : VS_END;
 wire [11:0] vs_x    = vs_half ? HS_BEG + HALF_LN - H_TOTAL : HS_BEG;
