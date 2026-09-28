@@ -167,9 +167,11 @@ assign ADC_SCK    = 1'b0;
 assign ADC_SDI    = 1'b0;
 assign ADC_CONVST = 1'b0;
 
+`ifndef CRT_LINE_MODE
 assign LED_USER  = 1'bZ;
 assign LED_HDD   = 1'bZ;
 assign LED_POWER = 1'bZ;
+`endif
 
 // board LEDs: liveness + bring-up status
 assign LED = {2'd0, pvr_mmio_rst, pvr_busy_led, ~pll_locked, spg_underrun, hb_hdmi, hb_sys};
@@ -862,6 +864,7 @@ always @(posedge clk_hdmi) ypbpr_s <= {ypbpr_s[0], crt_ctrl[4]};
 
 wire [23:0] vga_o;
 wire        vga_cs_o;
+wire        vga_de_o;
 vga_out vga_out
 (
 	.clk     (clk_hdmi),
@@ -869,21 +872,60 @@ vga_out vga_out
 	.hsync   (1'b0),
 	.vsync   (1'b0),
 	.csync   (hdmi_cs),
-	.de      (1'b0),
+	.de      (hdmi_de),
 	.din     (hdmi_data),
 	.dout    (vga_o),
 	.hsync_o (),
 	.vsync_o (),
 	.csync_o (vga_cs_o),
-	.de_o    ()
+	.de_o    (vga_de_o)
 );
 
 reg [23:0] vga_d;
 reg        vga_cs_n;
+reg        vga_de;
 always @(posedge clk_hdmi) begin
 	vga_d    <= vga_o;
 	vga_cs_n <= ~vga_cs_o;
+	vga_de   <= vga_de_o;
 end
+
+// Carriers with a real video DAC behind an MCP23009 (MiSTer I/O board v6+,
+// MiSTercade V2, SuperStation's ADV7125, ...) take its control lines on the
+// LED pins, exactly as Template_MiSTer's sys_top drives them: pixel clock
+// (inverted DDR copy of the video clock) on LED_USER, blanking (DE) on
+// LED_POWER, sync-on-green on LED_HDD (off here, as vga_sog=0; boards like
+// the SuperStation add SOG themselves). Without the clock such a DAC stays
+// dark - resistor-ladder carriers only need the VGA pins.
+wire vga_tx_clk_o;
+altddio_out
+#(
+	.extend_oe_disable("OFF"),
+	.intended_device_family("Cyclone V"),
+	.invert_output("OFF"),
+	.lpm_hint("UNUSED"),
+	.lpm_type("altddio_out"),
+	.oe_reg("UNREGISTERED"),
+	.power_up_high("OFF"),
+	.width(1)
+)
+vgaclk_ddr
+(
+	.datain_h(1'b0),
+	.datain_l(1'b1),
+	.outclock(clk_hdmi),
+	.dataout(vga_tx_clk_o),
+	.aclr(~mcp_en & ~av_dis),
+	.aset(1'b0),
+	.oe(~av_dis),
+	.outclocken(1'b1),
+	.sclr(1'b0),
+	.sset(1'b0)
+);
+
+assign LED_USER  = vga_tx_clk_o;
+assign LED_POWER = av_dis ? 1'bZ : mcp_en ? vga_de : 1'bZ;
+assign LED_HDD   = av_dis ? 1'bZ : mcp_en ? 1'b0   : 1'bZ;
 
 assign VGA_R  = av_dis ? 6'bZZZZZZ : vga_d[23:18];
 assign VGA_G  = av_dis ? 6'bZZZZZZ : vga_d[15:10];
