@@ -380,7 +380,8 @@ pvr_mmio
 	.fb_top           (fb_top_base),
 	.fb_bot           (fb_bot_base),
 	.vram_cfg         (pvr_vram_cfg),
-	.crt_ctrl         (crt_ctrl)
+	.crt_ctrl         (crt_ctrl),
+	.raster_vbl       (hdmi_vbl)
 );
 
 //////////////////////////////////////////////////////////////////////////

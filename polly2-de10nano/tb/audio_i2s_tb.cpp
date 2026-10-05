@@ -22,6 +22,8 @@
 static const uint32_t AUDIO_DATA = 0x2018;
 static const uint32_t REVISION   = 0x201C;
 static const uint32_t VRAM_BASE  = 0x2000;
+static const uint32_t RASTER     = 0x2038;
+static const uint32_t RASTER_PER = 0x203C;
 
 static Vaudio_tb_top* dut;
 static int errors = 0;
@@ -131,6 +133,8 @@ int main(int argc, char** argv) {
     dut->avs_writedata = 0; dut->avs_byteenable = 0;
     dut->eval();
 
+    avm_write(0x2030, 0);   // AUDIO_VOL: unattenuated (power-up may be AUD_ATT_INIT)
+
     // ---- idle: silence + zero level ----
     run_frames(3);
     for (auto& f : frames)
@@ -213,6 +217,24 @@ int main(int argc, char** argv) {
         }
     }
     if (avm_read(AUDIO_DATA) != 0) { printf("level != 0 after drain\n"); errors++; }
+
+    // ---- RASTER / RASTER_PERIOD (REVISION 7): a vblank level every P
+    // clk_sys cycles (high for 300) -> period P exactly, since counts up from
+    // the rising edge, count bumps once per period ----
+    {
+        const int P = 5000;
+        uint32_t c0 = avm_read(RASTER) >> 24;
+        for (int f = 0; f < 3; f++)
+            for (int c = 0; c < P; c++) { dut->raster_vbl = c < 300; dut->eval(); sys_edge(nullptr); }
+        uint32_t per = avm_read(RASTER_PER) & 0xFFFFFF;
+        uint32_t r = avm_read(RASTER), since = r & 0xFFFFFF, cnt = (r >> 24) - c0;
+        // 2 reads after the last edge: since ~ P - sync delay + read cycles
+        printf("raster: period %u since %u count +%u\n", per, since, cnt & 0xFF);
+        if (per != (uint32_t)P) { printf("RASTER_PERIOD %u != %d\n", per, P); errors++; }
+        if (since < P - 10 || since > P + 20) { printf("RASTER since %u out of range\n", since); errors++; }
+        if ((cnt & 0xFF) != 3) { printf("RASTER count +%u != 3\n", cnt & 0xFF); errors++; }
+        if (avm_read(0x201C) < 7) { printf("REVISION < 7\n"); errors++; }
+    }
 
     printf("frames=%zu stalled_pushes=%d max_stall=%d\n",
            frames.size(), stalled, max_stall);

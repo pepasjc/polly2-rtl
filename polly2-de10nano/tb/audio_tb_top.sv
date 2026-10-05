@@ -6,6 +6,7 @@ module audio_tb_top
 (
 	input  wire        clk_sys,
 	input  wire        clk_audio,
+	input  wire        raster_vbl,   // output raster vblank level (RASTER regs)
 
 	// Avalon-MM slave (what hps_lw_bridge would drive)
 	input  wire [20:0] avs_address,
@@ -26,6 +27,7 @@ module audio_tb_top
 wire        aud_wr, aud_full;
 wire [31:0] aud_wdata;
 wire [11:0] aud_level;
+wire  [4:0] aud_att;
 
 pvr_mmio mmio
 (
@@ -54,9 +56,12 @@ pvr_mmio mmio
 	.aud_wdata        (aud_wdata),
 	.aud_full         (aud_full),
 	.aud_level        (aud_level),
+	.aud_att          (aud_att),
 
 	.fb_top           (),
-	.fb_bot           ()
+	.fb_bot           (),
+	.crt_ctrl         (),
+	.raster_vbl       (raster_vbl)
 );
 
 audio_i2s audio_i2s
@@ -66,6 +71,8 @@ audio_i2s audio_i2s
 	.wdata(aud_wdata),
 	.full (aud_full),
 	.level(aud_level),
+	.att  (aud_att),
+	.cur_sample(),
 
 	.aclk (clk_audio),
 	.sclk (sclk),

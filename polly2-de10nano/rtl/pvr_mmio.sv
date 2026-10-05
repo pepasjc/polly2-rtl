@@ -137,7 +137,10 @@ module pvr_mmio
 	output reg  [31:0] vram_cfg  = 32'd0,    // [0] VRAM_16MB (0 = 8 MB + mirror)
 
 	// CRT_CTRL: SPG 15 kHz options ([0] field swap, [2:1] vertical filter)
-	output reg   [4:0] crt_ctrl  = 5'd0
+	output reg   [4:0] crt_ctrl  = 5'd0,
+
+	// output raster vertical blank (video clock domain, level)
+	input  wire        raster_vbl
 );
 
 // no size casts (Quartus Standard 17.0)
@@ -145,12 +148,22 @@ module pvr_mmio
 localparam [8:0] RSTC = RST_CYCLES;
 /* verilator lint_on WIDTHTRUNC */
 
+// RASTER / RASTER_PERIOD (REVISION 7), for locking the emulator's vblank to
+// the real output raster:
+//   0xFF202038  RASTER        RO. [23:0] clk_sys cycles since the output
+//                             raster last ENTERED vertical blanking
+//                             (saturates at 0xFFFFFF), [31:24] count of
+//                             vblank starts (wraps).
+//   0xFF20203C  RASTER_PERIOD RO. [23:0] clk_sys cycles between the last two
+//                             vblank starts (one field: 480i and 240p both
+//                             ~59.94 Hz). since / period = raster phase,
+//                             independent of the 75 / 100 MHz core clock.
 // MMIO interface revision (REVISION reg): bump on every interface change.
-// 6 = current; 5 = a short-lived internal build (never shipped); 4 = VRAM_CFG
+// 7 = RASTER / RASTER_PERIOD; 6 = CRT_CTRL era; 5 = a short-lived internal build (never shipped); 4 = VRAM_CFG
 // (16 MB select); 3 = render-done f2h IRQ1 (raised in sys_top, not here - see
 // the pvr_render_irq block there); 2 = border bands (FB_TOP/FB_BOT); 1 = audio
 // (AUDIO_DATA + REVISION added); 0 = anything older.
-localparam [31:0] REVISION = 32'd6;
+localparam [31:0] REVISION = 32'd7;
 
 wire wr32     = avs_write && (avs_byteenable == 4'b1111);
 wire sel_regs = (avs_address[20:13] == 8'd0);     // 0x0000-0x1FFF
@@ -172,6 +185,24 @@ reg        busy      = 1'b0;
 reg        done_stk  = 1'b0;
 reg        done_q    = 1'b0;
 reg [31:0] cycles    = 32'd0;
+
+// RASTER: raster_vbl synchronised into clk; on each rising edge (the raster
+// enters vertical blanking) the elapsed count becomes the period and the
+// count restarts. vblank lasts ~22 lines, so the edge is never missed.
+reg  [2:0] vbl_s       = 3'd0;
+reg [23:0] rst_since   = 24'd0;
+reg [23:0] rst_period  = 24'd0;
+reg  [7:0] rst_count   = 8'd0;
+always @(posedge clk) begin
+	vbl_s <= {vbl_s[1:0], raster_vbl};
+	if (vbl_s[1] && !vbl_s[2]) begin
+		rst_period <= rst_since;
+		rst_since  <= 24'd1;
+		rst_count  <= rst_count + 8'd1;
+	end
+	else if (rst_since != 24'hFFFFFF)
+		rst_since <= rst_since + 24'd1;
+end
 
 always @(posedge clk) begin
 	pvr_wr <= 1'b0;
@@ -247,6 +278,8 @@ always @(posedge clk) begin
 			4'd10: avs_readdata <= vram_cfg;               // VRAM_CFG
 			4'd12: avs_readdata <= {27'd0, aud_att};       // AUDIO_VOL
 			4'd13: avs_readdata <= {27'd0, crt_ctrl};      // CRT_CTRL
+			4'd14: avs_readdata <= {rst_count, rst_since}; // RASTER
+			4'd15: avs_readdata <= {8'd0, rst_period};     // RASTER_PERIOD
 			default: ;
 		endcase
 	end
