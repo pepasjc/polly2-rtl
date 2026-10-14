@@ -27,6 +27,15 @@
 //
 //============================================================================
 
+// CRT_LINE_MODE alone: the 15 kHz raster replaces 1080p on the HDMI pins
+// (direct-video DACs) and also feeds the analog pins. With CRT_DUAL the HDMI
+// output stays the stock 1080p and the 15 kHz raster gets its own spg.
+`ifdef CRT_LINE_MODE
+`ifndef CRT_DUAL
+`define CRT_ON_HDMI
+`endif
+`endif
+
 module sys_top
 (
 	/////////// CLOCK //////////
@@ -344,6 +353,7 @@ wire  [4:0] aud_att;
 
 wire [31:0] fb_top_base, fb_bot_base;
 wire  [4:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
+wire        raster_vbl_src; // RASTER registers: the raster minicast locks to
 
 pvr_mmio
 `ifdef CRT_LINE_MODE
@@ -381,7 +391,7 @@ pvr_mmio
 	.fb_bot           (fb_bot_base),
 	.vram_cfg         (pvr_vram_cfg),
 	.crt_ctrl         (crt_ctrl),
-	.raster_vbl       (hdmi_vbl)
+	.raster_vbl       (raster_vbl_src)
 );
 
 //////////////////////////////////////////////////////////////////////////
@@ -622,8 +632,17 @@ wire        spg_underrun;
 // CRT build: `define CRT_LINE_MODE 1 (240p) / 2 (480i) / 3 (either, picked
 // at run time by CRT_CTRL[3]) selects a 15 kHz
 // 1440-wide raster at the 27 MHz pll_hdmi (MiSTercade / direct-video DACs).
+// With CRT_DUAL this instance stays the stock 1080p HDMI scanout and the
+// 15 kHz raster is spg_crt below.
+wire [27:0]  hdmi_vbuf_address;
+wire  [7:0]  hdmi_vbuf_burstcount;
+wire         hdmi_vbuf_waitrequest;
+wire [127:0] hdmi_vbuf_readdata;
+wire         hdmi_vbuf_readdatavalid;
+wire         hdmi_vbuf_read;
+
 spg
-`ifdef CRT_LINE_MODE
+`ifdef CRT_ON_HDMI
 #(
 	.H_ACTIVE(1440), .H_FP(38), .H_SYNC(124), .H_BP(114),   // H total 1716 -> 15.73 kHz
 	.V_ACTIVE(240),  .V_FP(4),  .V_SYNC(3),   .V_BP(15),    // 262 (+1 in 480i field 1)
@@ -663,12 +682,12 @@ spg
 	.fb_bot_base (fb_bot_base),
 
 	.avl_clk          (clk_100m),
-	.avl_read         (vbuf_read),
-	.avl_address      (vbuf_address),
-	.avl_burstcount   (vbuf_burstcount),
-	.avl_waitrequest  (vbuf_waitrequest),
-	.avl_readdata     (vbuf_readdata),
-	.avl_readdatavalid(vbuf_readdatavalid),
+	.avl_read         (hdmi_vbuf_read),
+	.avl_address      (hdmi_vbuf_address),
+	.avl_burstcount   (hdmi_vbuf_burstcount),
+	.avl_waitrequest  (hdmi_vbuf_waitrequest),
+	.avl_readdata     (hdmi_vbuf_readdata),
+	.avl_readdatavalid(hdmi_vbuf_readdatavalid),
 
 	.red   (hdmi_data[23:16]),
 	.green (hdmi_data[15:8]),
@@ -689,15 +708,149 @@ spg
 reg        hdmi_out_hs, hdmi_out_vs, hdmi_out_de;
 reg [23:0] hdmi_out_d;
 
+`ifdef CRT_DUAL
+//////////////////////////////////////////////////////////////////////////
+// CRT_DUAL: the 15 kHz raster on its own 27 MHz PLL and spg instance; the
+// HPS framebuffer read port is shared with the HDMI spg by vbuf_arbiter
+// (burst-level round robin, from emashzed/r6b/crt).
+//////////////////////////////////////////////////////////////////////////
+wire clk_crt;
+pll_hdmi_27m_0002 pll_crt
+(
+	.refclk(FPGA_CLK1_50),
+	.rst(1'b0),
+	.reconfig_to_pll(64'd0),
+	.reconfig_from_pll(),
+	.outclk_0(clk_crt),
+	.locked()
+);
+
+wire [27:0]  crt_vbuf_address;
+wire  [7:0]  crt_vbuf_burstcount;
+wire         crt_vbuf_waitrequest;
+wire [127:0] crt_vbuf_readdata;
+wire         crt_vbuf_readdatavalid;
+wire         crt_vbuf_read;
+
+wire [23:0] crt_data;
+wire        crt_hs, crt_vs, crt_de, crt_vbl, crt_brd, crt_underrun;
+
+spg
+#(
+	.H_ACTIVE(1440), .H_FP(38), .H_SYNC(124), .H_BP(114),   // H total 1716 -> 15.73 kHz
+	.V_ACTIVE(240),  .V_FP(4),  .V_SYNC(3),   .V_BP(15),    // 262 (+1 in 480i field 1)
+	.LINE_MODE(`CRT_LINE_MODE),
+`ifdef CRT_VFILT_TAPS
+	.VFILT_TAPS(`CRT_VFILT_TAPS),
+`endif
+`ifdef CRT_FIELD_SWAP
+	.FIELD_SWAP(1)
+`else
+	.FIELD_SWAP(0)
+`endif
+)
+spg_crt
+(
+	.clk         (clk_crt),
+	.reset       (reset_req),
+
+	.fb_base     (fb_disp_base),
+	.fb_stride   (fb_disp_stride),
+	.fb_line_dbl (fb_disp_linedbl),
+	.fb_pix_dbl  (fb_disp_pixdbl),
+	.fb_split    (1'b1),
+	.fb_disp_half(spvr_fb_r_sof1[22]),
+	.fb_depth    (fb_disp_depth),
+	.fb_concat   (spvr_fb_r_ctrl[6:4]),
+	.fb_enable   (spvr_fb_r_ctrl[0]),
+
+	.crt_ctrl    (crt_ctrl[3:0]),
+
+	.fb_top_base (32'd0),                // border bands: HDMI only
+	.fb_bot_base (32'd0),
+
+	.avl_clk          (clk_100m),
+	.avl_read         (crt_vbuf_read),
+	.avl_address      (crt_vbuf_address),
+	.avl_burstcount   (crt_vbuf_burstcount),
+	.avl_waitrequest  (crt_vbuf_waitrequest),
+	.avl_readdata     (crt_vbuf_readdata),
+	.avl_readdatavalid(crt_vbuf_readdatavalid),
+
+	.red   (crt_data[23:16]),
+	.green (crt_data[15:8]),
+	.blue  (crt_data[7:0]),
+	.hsync (crt_hs),
+	.vsync (crt_vs),
+	.de    (crt_de),
+	.vblank(crt_vbl),
+	.border(crt_brd),
+
+	.src_line  (),
+	.vblank_in (),
+	.vblank_out(),
+	.underrun  (crt_underrun)
+);
+
+vbuf_arbiter vbuf_arbiter
+(
+	.clk               (clk_100m),
+	.reset             (reset_req),
+	.m0_read           (crt_vbuf_read),
+	.m0_address        (crt_vbuf_address),
+	.m0_burstcount     (crt_vbuf_burstcount),
+	.m0_waitrequest    (crt_vbuf_waitrequest),
+	.m0_readdata       (crt_vbuf_readdata),
+	.m0_readdatavalid  (crt_vbuf_readdatavalid),
+	.m1_read           (hdmi_vbuf_read),
+	.m1_address        (hdmi_vbuf_address),
+	.m1_burstcount     (hdmi_vbuf_burstcount),
+	.m1_waitrequest    (hdmi_vbuf_waitrequest),
+	.m1_readdata       (hdmi_vbuf_readdata),
+	.m1_readdatavalid  (hdmi_vbuf_readdatavalid),
+	.s_read            (vbuf_read),
+	.s_address         (vbuf_address),
+	.s_burstcount      (vbuf_burstcount),
+	.s_waitrequest     (vbuf_waitrequest),
+	.s_readdata        (vbuf_readdata),
+	.s_readdatavalid   (vbuf_readdatavalid)
+);
+
+// the analog block's video source; minicast's vblank lock follows the CRT
+wire        vid_clk  = clk_crt;
+wire [23:0] vid_data = crt_data;
+wire        vid_hs   = crt_hs;
+wire        vid_vs   = crt_vs;
+wire        vid_de   = crt_de;
+assign raster_vbl_src = crt_vbl;
+`else
+// single scanout: the HDMI spg owns the framebuffer port
+assign vbuf_read               = hdmi_vbuf_read;
+assign vbuf_address            = hdmi_vbuf_address;
+assign vbuf_burstcount         = hdmi_vbuf_burstcount;
+assign hdmi_vbuf_waitrequest   = vbuf_waitrequest;
+assign hdmi_vbuf_readdata      = vbuf_readdata;
+assign hdmi_vbuf_readdatavalid = vbuf_readdatavalid;
+assign raster_vbl_src          = hdmi_vbl;
 `ifdef CRT_LINE_MODE
-// CRT build: composite sync (Template_MiSTer csync module). Drives the analog
-// VGA_HS pin, and with CRT_CSYNC also the HDMI HSYNC line, exactly like
-// Main_MiSTer's direct_video with composite_sync=1 (dv_hs1 <= csync_en ? dv_cs : dv_hs).
-wire hdmi_cs;
-csync csync_hdmi(clk_hdmi, hdmi_hs, hdmi_vs, hdmi_cs);
+wire        vid_clk  = clk_hdmi;
+wire [23:0] vid_data = hdmi_data;
+wire        vid_hs   = hdmi_hs;
+wire        vid_vs   = hdmi_vs;
+wire        vid_de   = hdmi_de;
+`endif
 `endif
 
 `ifdef CRT_LINE_MODE
+// CRT build: composite sync (Template_MiSTer csync module). Drives the analog
+// VGA_HS pin, and with CRT_CSYNC (single-output CRT) also the HDMI HSYNC
+// line, exactly like Main_MiSTer's direct_video with composite_sync=1
+// (dv_hs1 <= csync_en ? dv_cs : dv_hs).
+wire vid_cs;
+csync csync_vid(vid_clk, vid_hs, vid_vs, vid_cs);
+`endif
+
+`ifdef CRT_ON_HDMI
 // CRT build: Main_MiSTer direct_video DE (Template sys_top dv_de1): DE high
 // for the whole line except hsync (+4 px after it) on all lines but the few
 // around vsync. Direct-video HDMI DACs get the same stream as from a MiSTer
@@ -734,13 +887,17 @@ always @(posedge clk_hdmi) begin
 	reg hs, vs, de;
 	reg [23:0] d;
 
+`ifdef CRT_ON_HDMI
 `ifdef CRT_CSYNC
-	hs <= hdmi_cs;
+	hs <= vid_cs;
+`else
+	hs <= hdmi_hs;
+`endif
 `else
 	hs <= hdmi_hs;
 `endif
 	vs <= hdmi_vs;
-`ifdef CRT_LINE_MODE
+`ifdef CRT_ON_HDMI
 	de <= hdmi_dv_de;
 `else
 	de <= hdmi_de;
@@ -861,20 +1018,20 @@ wire sd_cd  = SDCD_SPDIF & ~SW[2];
 // YPbPr (Pr/Y/Pb on R/G/B) when CRT_CTRL[4] asks for vga_mode=ypbpr. Both
 // take the same 3-stage pipeline, and csync rides through it alongside.
 reg  [1:0] ypbpr_s = 2'd0;       // CRT_CTRL[4] (clk_sys, quasi-static)
-always @(posedge clk_hdmi) ypbpr_s <= {ypbpr_s[0], crt_ctrl[4]};
+always @(posedge vid_clk) ypbpr_s <= {ypbpr_s[0], crt_ctrl[4]};
 
 wire [23:0] vga_o;
 wire        vga_cs_o;
 wire        vga_de_o;
 vga_out vga_out
 (
-	.clk     (clk_hdmi),
+	.clk     (vid_clk),
 	.ypbpr_en(ypbpr_s[1]),
 	.hsync   (1'b0),
 	.vsync   (1'b0),
-	.csync   (hdmi_cs),
-	.de      (hdmi_de),
-	.din     (hdmi_data),
+	.csync   (vid_cs),
+	.de      (vid_de),
+	.din     (vid_data),
 	.dout    (vga_o),
 	.hsync_o (),
 	.vsync_o (),
@@ -885,7 +1042,7 @@ vga_out vga_out
 reg [23:0] vga_d;
 reg        vga_cs_n;
 reg        vga_de;
-always @(posedge clk_hdmi) begin
+always @(posedge vid_clk) begin
 	vga_d    <= vga_o;
 	vga_cs_n <= ~vga_cs_o;
 	vga_de   <= vga_de_o;
@@ -914,7 +1071,7 @@ vgaclk_ddr
 (
 	.datain_h(1'b0),
 	.datain_l(1'b1),
-	.outclock(clk_hdmi),
+	.outclock(vid_clk),
 	.dataout(vga_tx_clk_o),
 	.aclr(~mcp_en & ~av_dis),
 	.aset(1'b0),

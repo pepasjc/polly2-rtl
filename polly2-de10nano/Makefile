@@ -21,7 +21,7 @@ TSP_PKG = ../polly2-core/rtl/gen/tsp_pkg.sv
 # polly2-core video-out (framebuffer write master) instantiated by simplex_pvr_top
 VO_RTL  = ../polly2-core/rtl/vo.sv
 
-all: spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p spg-15k fb-write render-irq
+all: spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p spg-15k dual-scan fb-write render-irq
 
 #   make fb-write - FB write master formats: every FB_W_CTRL packmode
 #                   (0555K/565/4444/1555/888/0888K/8888, refsw2 dither
@@ -170,4 +170,16 @@ obj_dir/pvr_burst_tb: rtl/simplex_pvr_top.sv $(VO_RTL) tb/peel_core_stub.sv tb/p
 clean:
 	rm -rf obj_dir
 
-.PHONY: all spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p spg-15k fb-write render-irq clean
+#   make dual-scan - CRT_DUAL display path: 1080p HDMI spg + 15 kHz CRT spg
+#                    (LINE_MODE 3) sharing one DDR port through vbuf_arbiter;
+#                    every CRT pixel in 240p and 480i vs a model, no underrun
+#                    on either scanout, HDMI keeps producing frames
+dual-scan: obj_dir/dual_scan/dual_scan_tb
+	./obj_dir/dual_scan/dual_scan_tb
+
+obj_dir/dual_scan/dual_scan_tb: rtl/spg.sv rtl/vbuf_arbiter.sv tb/dual_scan_top.sv tb/dual_scan_tb.cpp
+	mkdir -p obj_dir && $(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-UNSIGNED -Wno-PINCONNECTEMPTY \
+	    --top-module dual_scan_top --Mdir obj_dir/dual_scan \
+	    rtl/spg.sv rtl/vbuf_arbiter.sv tb/dual_scan_top.sv tb/dual_scan_tb.cpp -o dual_scan_tb
+
+.PHONY: all spg-sync pvr-burst spg-loopback audio-i2s spg-bands spg-depth spg-240p spg-15k dual-scan fb-write render-irq clean

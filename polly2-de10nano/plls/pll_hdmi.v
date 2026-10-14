@@ -14,8 +14,13 @@ module pll_hdmi (
 	);
 
 `ifdef CRT_LINE_MODE
+`ifndef CRT_DUAL
 	// CRT build: 27.000 MHz for the 15 kHz spg raster (Quartus 18.1 ip-generate)
 	pll_hdmi_27m_0002 pll_hdmi_inst (
+`else
+	// CRT_DUAL: HDMI stays 1080p; the 15 kHz raster has its own pll_crt
+	pll_hdmi_0002 pll_hdmi_inst (
+`endif
 `else
 	pll_hdmi_0002 pll_hdmi_inst (
 `endif
