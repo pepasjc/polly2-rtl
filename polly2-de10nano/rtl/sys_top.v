@@ -343,7 +343,7 @@ wire [11:0] aud_fifo_level;
 wire  [4:0] aud_att;
 
 wire [31:0] fb_top_base, fb_bot_base;
-wire  [4:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter
+wire  [5:0] crt_ctrl;       // CRT_CTRL: spg 15 kHz field swap / vertical filter / HDMI TV
 
 pvr_mmio
 `ifdef CRT_LINE_MODE
@@ -730,18 +730,27 @@ always @(posedge clk_hdmi) begin
 end
 `endif
 
+`ifdef CRT_LINE_MODE
+// CRT_CTRL[5]: HDMI as a standard TV signal - the raster already has the CEA
+// 1440x480i / 1440x240p timing (1716 x 262.5 / 262 at 27 MHz, same porches),
+// so a TV only needs separate syncs and DE on the active picture. 0 = the
+// direct-video signalling above, for DAC adapters. Quasi-static (clk_sys).
+reg [1:0] hdmi_tv_s = 2'd0;
+always @(posedge clk_hdmi) hdmi_tv_s <= {hdmi_tv_s[0], crt_ctrl[5]};
+`endif
+
 always @(posedge clk_hdmi) begin
 	reg hs, vs, de;
 	reg [23:0] d;
 
 `ifdef CRT_CSYNC
-	hs <= hdmi_cs;
+	hs <= hdmi_tv_s[1] ? hdmi_hs : hdmi_cs;
 `else
 	hs <= hdmi_hs;
 `endif
 	vs <= hdmi_vs;
 `ifdef CRT_LINE_MODE
-	de <= hdmi_dv_de;
+	de <= hdmi_tv_s[1] ? hdmi_de : hdmi_dv_de;
 `else
 	de <= hdmi_de;
 `endif
